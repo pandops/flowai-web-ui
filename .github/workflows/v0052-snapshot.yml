@@ -12,6 +12,6 @@ jobs:
     permissions:
       actions: read
       packages: write
-    uses: pandops/flowai-team-registry/.github/workflows/v0052-publish-oci.yml@a2f4fd70aa70240f24baa3cd2e934e5a793cf4db
+    uses: pandops/flowai-team-registry/.github/workflows/v0052-publish-oci.yml@909e27e7ed998029d9bdab7ab8551bc00906bd6d
     with:
       expected_workflow_sha: ${{ inputs.expected_workflow_sha }}
