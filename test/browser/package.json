@@ -1,0 +1,17 @@
+{
+  "name": "flowai-web-ui-browser",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Web UI browser unit tests: the real Web UI image against a test-only mocked API.",
+  "type": "commonjs",
+  "scripts": {
+    "test": "bash qualify-browser.sh"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "@types/node": "^26.1.1",
+    "@types/ws": "^8.18.1",
+    "typescript": "^7.0.2",
+    "ws": "^8.21.1"
+  }
+}
