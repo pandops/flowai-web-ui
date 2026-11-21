@@ -279,10 +279,40 @@ jobs:
           trap 'rm -rf -- "$export_dir"' EXIT
           mkdir "$RUNNER_TEMP/oci" "$export_dir/layout"
           docker image save --output "$export_dir/tested.docker.tar" "$iid"
-          docker run --rm --network none --platform linux/amd64 --entrypoint /usr/bin/skopeo \
-            --user "$(id -u):$(id -g)" --env HOME=/tmp \
-            --volume "$export_dir/tested.docker.tar:/tested.docker.tar:ro" \
-            --volume "$export_dir/layout:/layout" "$SKOPEO" \
+          python3 - "$export_dir/tested.docker.tar" "$iid" > "$RUNNER_TEMP/web-ui-source-docker-config.json" <<'DOCKER_CONFIG'
+          import hashlib
+          import json
+          import re
+          import sys
+          import tarfile
+
+          archive_path, iid = sys.argv[1:]
+          with tarfile.open(archive_path) as archive:
+              members = archive.getmembers()
+
+              def read_member(name):
+                  entry, = [member for member in members if member.name == name]
+                  if not entry.isfile():
+                      raise ValueError("Docker archive config or manifest is not a regular file")
+                  return archive.extractfile(entry).read()
+
+              image, = json.loads(read_member("manifest.json"))
+              path = image["Config"]
+              if not re.fullmatch(r"(?:blobs/sha256/[0-9a-f]{64}|[0-9a-f]{64}\.json)", path):
+                  raise ValueError("Unexpected Docker image config path")
+              config = read_member(path)
+              if "sha256:" + hashlib.sha256(config).hexdigest() != iid:
+                  raise ValueError("Docker archive config differs from the browser-tested image ID")
+              sys.stdout.buffer.write(config)
+          DOCKER_CONFIG
+          echo "Verified Docker archive config raw digest $iid"
+
+          skopeo=(docker run --rm --network none --platform linux/amd64 --entrypoint /usr/bin/skopeo
+            --user "$(id -u):$(id -g)" --env HOME=/tmp
+            --volume "$export_dir/tested.docker.tar:/tested.docker.tar:ro")
+          "${skopeo[@]}" "$SKOPEO" inspect --config docker-archive:/tested.docker.tar \
+            > "$RUNNER_TEMP/web-ui-source-oci-config.json"
+          "${skopeo[@]}" --volume "$export_dir/layout:/layout" "$SKOPEO" \
             copy --format oci docker-archive:/tested.docker.tar oci:/layout
           tar --format=ustar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
             -cf "$RUNNER_TEMP/oci/image.oci.tar" -C "$export_dir/layout" oci-layout index.json blobs
@@ -348,8 +378,13 @@ jobs:
           assert.equal(manifest.schemaVersion, 2);
           if (manifest.mediaType !== undefined) assert.equal(manifest.mediaType, image.mediaType);
           assert.equal(manifest.config.mediaType, oci + "config.v1+json");
-          assert.equal(manifest.config.digest, iid, "OCI config differs from the browser-tested image ID");
           const config = readJSON(await verifyBlob(manifest.config));
+          const sourceOCIConfig = readJSON(join(process.env.RUNNER_TEMP, "web-ui-source-oci-config.json"));
+          const sourceDockerConfig = readJSON(join(process.env.RUNNER_TEMP, "web-ui-source-docker-config.json"));
+          assert.deepEqual(config, sourceOCIConfig, "OCI config differs from the normalized tested Docker config");
+          assert.deepEqual(config.rootfs, sourceDockerConfig.rootfs, "OCI rootfs differs from the tested Docker config");
+          assert.equal(config.os, sourceDockerConfig.os);
+          assert.equal(config.architecture, sourceDockerConfig.architecture);
           assert.equal(config.os + "/" + config.architecture, "linux/amd64");
           assert.equal(config.rootfs.type, "layers");
           assert.ok(manifest.layers.length > 0);
@@ -384,13 +419,15 @@ jobs:
             runId: Number(process.env.GITHUB_RUN_ID),
             runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
             platform: "linux/amd64",
-            configDigest: iid,
+            sourceImageId: iid,
+            configDigest: manifest.config.digest,
             manifestDigest: image.digest,
             archiveSha256: archiveChecksum,
           };
           writeFileSync(join(process.env.RUNNER_TEMP, "oci-provenance.json"), JSON.stringify(provenance, null, 2) + "\n", { flag: "wx" });
           writeFileSync(process.env.GITHUB_OUTPUT, "image=" + image.digest + "\n", { flag: "a" });
-          console.log("Qualified Web UI OCI manifest " + image.digest + " with tested config " + iid);
+          console.log("Qualified Web UI OCI manifest " + image.digest +
+            " with normalized config " + manifest.config.digest + " from tested image " + iid);
           OCI_CHECK
           sha256sum --check SHA256SUMS
 
