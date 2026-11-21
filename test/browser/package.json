@@ -4,9 +4,6 @@
   "private": true,
   "description": "Web UI browser unit tests: the real Web UI image against a test-only mocked API.",
   "type": "commonjs",
-  "scripts": {
-    "test": "bash qualify-browser.sh"
-  },
   "devDependencies": {
     "@playwright/test": "^1.61.1",
     "@types/node": "^26.1.1",

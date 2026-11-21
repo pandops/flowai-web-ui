@@ -67,7 +67,199 @@ jobs:
           cat "$RUNNER_TEMP/web-ui.iid"
 
       - name: Browser unit tests against the built image
-        run: bash test/browser/qualify-browser.sh "$(cat "$RUNNER_TEMP/web-ui.iid")"
+        working-directory: test/browser
+        shell: bash
+        run: |
+          if [[ "${GITHUB_ACTIONS:-}" != true || "${RUNNER_ENVIRONMENT:-}" != github-hosted ]]; then
+            echo 'Run this entry point on a dedicated GitHub-hosted job.' >&2
+            exit 1
+          fi
+          image_id="$(cat "$RUNNER_TEMP/web-ui.iid")"
+          [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$(docker image inspect --format '{{.Id}}' "$image_id")" == "$image_id" ]]
+
+          # The dedicated VM runs one worker, with a second Chromium only for native tests.
+          # Hold the VM's browser qualification lock through process and container absence.
+          exec 9< "${RUNNER_TEMP:?}"
+          flock -n 9
+          browser_root="$(mktemp -d /tmp/flowai-wui.XXXXXXXX)"
+          owner="web-ui-${browser_root##*.}"
+          container_id=''
+          child=''
+          # ShellCheck cannot see the EXIT trap's call through these heredocs.
+          # shellcheck disable=SC2329
+          cleanup() {
+            local status=$? cleanup_failed=0 owned
+            trap - EXIT HUP INT TERM
+            if [[ -n "$child" ]]; then
+              kill -TERM "$child" 2>/dev/null || true
+              wait "$child" || true
+            fi
+            if owned="$(docker ps -aq --no-trunc --filter "label=flowai.web-ui.qualification=$owner")"; then
+              if [[ -n "$owned" ]]; then
+                if [[ "$owned" =~ ^[0-9a-f]{64}$ && ( -z "$container_id" || "$owned" == "$container_id" ) ]]; then
+                  docker rm -f "$owned" >/dev/null || cleanup_failed=1
+                else
+                  cleanup_failed=1
+                fi
+              fi
+              if [[ "$cleanup_failed" == 0 ]] &&
+                 owned="$(docker ps -aq --filter "label=flowai.web-ui.qualification=$owner")" &&
+                 [[ -z "$owned" ]] &&
+                 { [[ -z "$container_id" ]] ||
+                   { owned="$(docker ps -aq --filter "id=$container_id")" && [[ -z "$owned" ]]; }; }; then
+                echo "Web UI container absence verified for $owner"
+              else
+                cleanup_failed=1
+              fi
+            else
+              cleanup_failed=1
+            fi
+            node --input-type=module - "$browser_root" <<'BROWSER_CLEANUP' || cleanup_failed=1
+          import { readFileSync, readdirSync, readlinkSync, rmSync, lstatSync } from "node:fs";
+          import { basename } from "node:path";
+          import { setTimeout as delay } from "node:timers/promises";
+
+          const root = process.argv[2];
+          if (!/^\/tmp\/flowai-wui\.[A-Za-z0-9]{8}$/.test(root ?? "")) {
+            throw new Error("Invalid Web UI browser resource namespace");
+          }
+
+          function owners() {
+            const processes = [];
+            for (const entry of readdirSync("/proc")) {
+              if (!/^[0-9]+$/.test(entry)) continue;
+              try {
+                const dir = `/proc/${entry}`;
+                if (lstatSync(dir).uid !== process.getuid()) continue;
+                const comm = readFileSync(`${dir}/comm`, "utf8").trim();
+                const browserProcess = /^(node|chrome|chromium)/;
+                // Node 24 can expose MainThread as comm.
+                if (!browserProcess.test(comm) &&
+                    !(comm === "MainThread" && browserProcess.test(basename(readlinkSync(`${dir}/exe`))))) continue;
+                const env = readFileSync(`${dir}/environ`, "utf8").split("\0");
+                const args = readFileSync(`${dir}/cmdline`, "utf8").split("\0");
+                if (
+                  env.includes(`FLOWAI_BROWSER_OWNER=${root}`) ||
+                  args.some((arg) => arg.startsWith(`--user-data-dir=${root}/`))
+                ) {
+                  processes.push(Number(entry));
+                }
+              } catch (error) {
+                if (error.code !== "ENOENT" && error.code !== "ESRCH") throw error;
+              }
+            }
+            return processes;
+          }
+
+          let stragglers = owners();
+          const leaked = stragglers.length > 0;
+          for (const signal of ["SIGTERM", "SIGKILL"]) {
+            if (!stragglers.length) break;
+            for (const pid of stragglers) {
+              if (!owners().includes(pid)) continue;
+              try {
+                process.kill(pid, signal);
+              } catch (error) {
+                if (error.code !== "ESRCH") throw error;
+              }
+            }
+            for (let attempt = 0; attempt < 30 && stragglers.length; attempt++) {
+              await delay(100);
+              stragglers = owners();
+            }
+          }
+          if (stragglers.length) throw new Error("Web UI browser processes remain");
+          rmSync(root, { recursive: true, force: true });
+          try {
+            lstatSync(root);
+            throw new Error("Web UI browser directory remains");
+          } catch (error) {
+            if (error.code !== "ENOENT") throw error;
+          }
+          console.log("Web UI browser process and temporary directory absence verified");
+          if (leaked) throw new Error("Web UI processes required forced cleanup");
+          BROWSER_CLEANUP
+            if [[ "$cleanup_failed" != 0 ]]; then exit 1; fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+          trap 'exit 129' HUP
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          container_id="$(docker create --pull=never --name "$owner" \
+            --label "flowai.web-ui.qualification=$owner" \
+            --publish 127.0.0.1::8080 "$image_id")"
+          [[ "$container_id" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$(docker inspect --format '{{.Image}}' "$container_id")" == "$image_id" ]]
+          docker start "$container_id" >/dev/null
+          port="$(docker port "$container_id" 8080/tcp)"
+          [[ "$port" =~ ^127\.0\.0\.1:[0-9]+$ ]]
+          origin="http://$port"
+          curl -fsS --retry 12 --retry-connrefused --retry-delay 1 --max-time 2 "$origin/healthz"
+          echo
+
+          FLOWAI_WEB_UI_ORIGIN="$origin" FLOWAI_WEB_UI_IMAGE_ID="$image_id" \
+            FLOWAI_BROWSER_NATIVE_TMP="$browser_root" FLOWAI_BROWSER_OWNER="$browser_root" \
+            TMPDIR="$browser_root" TMP="$browser_root" TEMP="$browser_root" \
+            node node_modules/playwright/cli.js test --workers=1 --retries=0 &
+          child=$!
+          browser_status=0
+          wait "$child" || browser_status=$?
+          child=''
+          report_status=0
+          node --input-type=module - test-results/results.json <<'BROWSER_REPORT' || report_status=$?
+          import { readFileSync } from "node:fs";
+
+          const matrix = JSON.parse(readFileSync("supported-resolutions.json"));
+          const report = JSON.parse(readFileSync(process.argv[2], "utf8"));
+          const counts = new Map(matrix.map((cell) => [cell.name, 0]));
+          const files = new Set();
+          const cases = [];
+
+          function collect(suite) {
+            for (const spec of suite.specs ?? []) {
+              files.add(spec.file);
+              cases.push(...spec.tests);
+            }
+            for (const child of suite.suites ?? []) collect(child);
+          }
+
+          report.suites.forEach(collect);
+          const passing = cases.filter(({ results }) => results.length === 1 && results[0].status === "passed");
+          console.log("Web UI browser unit results " + JSON.stringify({
+            specs: files.size,
+            cases: cases.length,
+            passed: passing.length,
+            skipped: report.stats.skipped,
+            unexpected: report.stats.unexpected,
+            flaky: report.stats.flaky,
+          }));
+          for (const { results: [result] } of passing) {
+            for (const att of result.attachments) {
+              if (att.name !== "supported-resolution" || !att.body) continue;
+              const sample = JSON.parse(Buffer.from(att.body, "base64"));
+              const cell = matrix.find((entry) =>
+                entry.width === sample.width && entry.height === sample.height &&
+                entry.deviceScaleFactor === sample.deviceScaleFactor &&
+                entry.hasTouch === sample.hasTouch && entry.colorScheme === sample.theme &&
+                sample.darkMedia === (entry.colorScheme === "dark"),
+              );
+              if (!cell) throw new Error(`Unexpected measured resolution: ${JSON.stringify(sample)}`);
+              counts.set(cell.name, counts.get(cell.name) + 1);
+            }
+          }
+          for (const cell of matrix) console.log(JSON.stringify({ ...cell, passedMeasurements: counts.get(cell.name) }));
+          if (
+            files.size !== 65 || cases.length !== 482 || passing.length !== 482 ||
+            report.errors.length || [...counts.values()].some((count) => count === 0)
+          ) {
+            throw new Error("Browser qualification requires all 482 cases and six measured cells to pass");
+          }
+          BROWSER_REPORT
+          if (( browser_status != 0 )); then exit "$browser_status"; fi
+          exit "$report_status"
 
       - name: Verify runner-local image after tests
         run: |
@@ -75,3 +267,146 @@ jobs:
           [[ "$(docker image inspect --format '{{.Id}}' "$iid")" == "$iid" ]]
           [[ "$(docker image inspect --format '{{len .RepoTags}}' "$iid")" == 0 ]]
           echo "Qualified runner-local Web UI OCI config ID $iid"
+
+      - name: Export the tested image as OCI
+        shell: bash
+        env:
+          SKOPEO: quay.io/skopeo/stable@sha256:8342e1e8d7b12d0bd3bf53ce8f4fde7ed876277aa8e4345f53937a505309e6b5
+        run: |
+          iid="$(cat "$RUNNER_TEMP/web-ui.iid")"
+          [[ "$iid" =~ ^sha256:[0-9a-f]{64}$ ]]
+          export_dir="$(mktemp -d "$RUNNER_TEMP/web-ui-export.XXXXXXXX")"
+          trap 'rm -rf -- "$export_dir"' EXIT
+          mkdir "$RUNNER_TEMP/oci" "$export_dir/layout"
+          docker image save --output "$export_dir/tested.docker.tar" "$iid"
+          docker run --rm --network none --platform linux/amd64 --entrypoint /usr/bin/skopeo \
+            --user "$(id -u):$(id -g)" --env HOME=/tmp \
+            --volume "$export_dir/tested.docker.tar:/tested.docker.tar:ro" \
+            --volume "$export_dir/layout:/layout" "$SKOPEO" \
+            copy --format oci docker-archive:/tested.docker.tar oci:/layout
+          tar --format=ustar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+            -cf "$RUNNER_TEMP/oci/image.oci.tar" -C "$export_dir/layout" oci-layout index.json blobs
+
+      - name: Verify OCI layout and digests
+        id: oci
+        shell: bash
+        run: |
+          evidence="$RUNNER_TEMP/oci"
+          archive="$evidence/image.oci.tar"
+          layout="$(mktemp -d "$RUNNER_TEMP/web-ui-layout.XXXXXXXX")"
+          trap 'rm -rf -- "$layout"' EXIT
+          tar --quoting-style=escape -tf "$archive" > "$layout/paths"
+          [[ -z "$(sort "$layout/paths" | uniq -d)" ]]
+          awk '
+            /^(oci-layout|index[.]json|blobs\/(sha256\/)?)$/ { next }
+            /^blobs\/sha256\/[0-9a-f]+$/ && length($0) == 77 { next }
+            { exit 1 }
+          ' "$layout/paths"
+          tar --quoting-style=escape -tvf "$archive" | awk '
+            /^-.* (oci-layout|index[.]json|blobs\/sha256\/[0-9a-f]+)$/ { next }
+            /^d.* blobs(\/sha256)?\/$/ { next }
+            { exit 1 }
+          '
+          mkdir "$layout/extracted"
+          tar -xf "$archive" -C "$layout/extracted" --no-same-owner --no-same-permissions
+          cd "$evidence"
+          sha256sum image.oci.tar | tee SHA256SUMS
+          node --input-type=module - "$layout/extracted" "$(cat "$RUNNER_TEMP/web-ui.iid")" <<'OCI_CHECK'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { createReadStream, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+          import { join } from "node:path";
+          import { pipeline } from "node:stream/promises";
+          import { createGunzip, createZstdDecompress } from "node:zlib";
+
+          const [layout, iid] = process.argv.slice(2);
+          const sha256 = /^sha256:[0-9a-f]{64}$/;
+          const oci = "application/vnd.oci.image.";
+          const readJSON = (path) => JSON.parse(readFileSync(path, "utf8"));
+          const index = readJSON(join(layout, "index.json"));
+          assert.equal(readJSON(join(layout, "oci-layout")).imageLayoutVersion, "1.0.0");
+          assert.equal(index.schemaVersion, 2);
+          assert.equal(index.manifests.length, 1);
+          const [image] = index.manifests;
+          assert.equal(image.mediaType, oci + "manifest.v1+json");
+
+          const blobs = join(layout, "blobs", "sha256");
+          const referenced = new Set();
+          async function verifyBlob(descriptor) {
+            assert.match(descriptor.digest, sha256);
+            const hex = descriptor.digest.slice(7);
+            const path = join(blobs, hex);
+            assert.equal(statSync(path).size, descriptor.size, "OCI blob size mismatch");
+            const hash = createHash("sha256");
+            await pipeline(createReadStream(path), hash);
+            assert.equal(hash.digest("hex"), hex, "OCI blob digest mismatch");
+            referenced.add(hex);
+            return path;
+          }
+
+          const manifest = readJSON(await verifyBlob(image));
+          assert.equal(manifest.schemaVersion, 2);
+          if (manifest.mediaType !== undefined) assert.equal(manifest.mediaType, image.mediaType);
+          assert.equal(manifest.config.mediaType, oci + "config.v1+json");
+          assert.equal(manifest.config.digest, iid, "OCI config differs from the browser-tested image ID");
+          const config = readJSON(await verifyBlob(manifest.config));
+          assert.equal(config.os + "/" + config.architecture, "linux/amd64");
+          assert.equal(config.rootfs.type, "layers");
+          assert.ok(manifest.layers.length > 0);
+          assert.equal(manifest.layers.length, config.rootfs.diff_ids.length);
+          for (const [i, layer] of manifest.layers.entries()) {
+            const path = await verifyBlob(layer);
+            const diffID = config.rootfs.diff_ids[i];
+            switch (layer.mediaType) {
+              case oci + "layer.v1.tar":
+                assert.equal(layer.digest, diffID, "OCI layer differs from the tested root filesystem");
+                break;
+              case oci + "layer.v1.tar+gzip":
+              case oci + "layer.v1.tar+zstd": {
+                const decoder = layer.mediaType.endsWith("+gzip") ? createGunzip() : createZstdDecompress();
+                const hash = createHash("sha256");
+                await pipeline(createReadStream(path), decoder, hash);
+                assert.equal("sha256:" + hash.digest("hex"), diffID, "OCI layer differs from the tested root filesystem");
+                break;
+              }
+              default:
+                throw new Error("Unexpected OCI layer media type: " + layer.mediaType);
+            }
+          }
+          assert.deepEqual(readdirSync(blobs).sort(), [...referenced].sort());
+
+          const archiveChecksum = readFileSync("SHA256SUMS", "utf8").trim().split(" ")[0];
+          assert.match(archiveChecksum, /^[0-9a-f]{64}$/);
+          const provenance = {
+            repository: process.env.GITHUB_REPOSITORY,
+            sourceSha: process.env.GITHUB_SHA,
+            workflowPath: ".github/workflows/qualify.yml",
+            runId: Number(process.env.GITHUB_RUN_ID),
+            runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
+            platform: "linux/amd64",
+            configDigest: iid,
+            manifestDigest: image.digest,
+            archiveSha256: archiveChecksum,
+          };
+          writeFileSync(join(process.env.RUNNER_TEMP, "oci-provenance.json"), JSON.stringify(provenance, null, 2) + "\n", { flag: "wx" });
+          writeFileSync(process.env.GITHUB_OUTPUT, "image=" + image.digest + "\n", { flag: "a" });
+          console.log("Qualified Web UI OCI manifest " + image.digest + " with tested config " + iid);
+          OCI_CHECK
+          sha256sum --check SHA256SUMS
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: upload
+        with:
+          name: oci-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/oci/
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: false
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: upload-provenance
+        with:
+          name: oci-provenance-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/oci-provenance.json
+          if-no-files-found: error
+          overwrite: false
