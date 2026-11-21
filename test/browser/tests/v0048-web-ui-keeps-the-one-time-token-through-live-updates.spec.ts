@@ -45,6 +45,15 @@ async function expectTokenGone(page: Page, token: string) {
   ).not.toContain(token);
 }
 
+const k8sCommand =
+  "helmfile -f .helmfile/executor.helmfile.yaml.gotmpl -e dtu --state-values-file executor.yaml apply";
+
+async function expectKubernetesToken(page: Page, token: string) {
+  const view = page.locator("[data-executor-token]");
+  await expect(view.locator("[data-token-value]")).toHaveText(token);
+  await expect(view.locator("[data-token-command]")).toHaveText(k8sCommand);
+}
+
 const reads = (requests: Recorded[], path: string) =>
   requests.filter((r) => r.method === "GET" && r.path === path).length;
 
@@ -144,9 +153,7 @@ test("v0048 one-time token view survives other Executors' live updates until Clo
     await expect.poll(() => reads(requests, list)).toBeGreaterThan(before);
     post.release();
     await expect(tokenHeading(page, 13)).toBeVisible();
-    await expect(page.locator("main")).toContainText(
-      "helm upgrade --install … --set broker.token=jwt-created-token",
-    );
+    await expectKubernetesToken(page, "jwt-created-token");
   });
 
   await test.step("Frames after the token view renders keep it open and unchanged", async () => {
@@ -159,7 +166,7 @@ test("v0048 one-time token view survives other Executors' live updates until Clo
     await expect(page.getByRole("heading", { level: 1 })).toHaveText(
       "Executor token",
     );
-    await expect(page.locator("main")).toContainText("jwt-created-token");
+    await expectKubernetesToken(page, "jwt-created-token");
     await expect(page.locator(".executor-filters")).toBeHidden();
     // Exactly one create, and the token was never fetched again.
     expect(requests.filter((r) => r.method === "POST")).toHaveLength(1);
@@ -239,9 +246,7 @@ test("v0048 reissued token view survives live updates on Executor detail · Web 
     await expect.poll(() => reads(requests, detail)).toBeGreaterThan(before);
     await page.waitForTimeout(500);
     await expect(tokenHeading(page, 8)).toBeVisible();
-    await expect(page.locator("main")).toContainText(
-      "helm upgrade --install … --set broker.token=jwt-reissued-8",
-    );
+    await expectKubernetesToken(page, "jwt-reissued-8");
     expect(posts()).toBe(1);
     await page
       .getByRole("button", { name: "Close and clear", exact: true })
@@ -261,7 +266,7 @@ test("v0048 reissued token view survives live updates on Executor detail · Web 
     await expect.poll(() => reads(requests, detail)).toBeGreaterThan(before);
     post.release();
     await expect(tokenHeading(page, 8)).toBeVisible();
-    await expect(page.locator("main")).toContainText("jwt-reissued-8");
+    await expectKubernetesToken(page, "jwt-reissued-8");
     expect(posts()).toBe(2);
     await page
       .getByRole("button", { name: "Close and clear", exact: true })

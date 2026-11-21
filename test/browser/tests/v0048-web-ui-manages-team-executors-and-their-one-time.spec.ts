@@ -1,19 +1,41 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import type { Page } from "@playwright/test";
 import { expect, test } from "../fixtures/owned-test";
 import type { MockedProxy } from "../fixtures/mocked_proxy";
 import {
   TEAM,
+  captureStreams,
   catalogRoutes,
+  event,
   executorRecord,
   executorRoutes,
   recordRequests,
   v0048Proxy,
   type ExecutorFake,
   type Recorded,
-  MATRIX,
   usePresentation,
   expectNoHorizontalScroll,
 } from "../fixtures/v0048-ui";
+
+type SupportedResolution = {
+  name: string;
+  width: number;
+  height: number;
+  deviceScaleFactor: number;
+  isMobile: boolean;
+  hasTouch: boolean;
+  colorScheme: "light" | "dark";
+};
+
+const supportedResolutions = JSON.parse(
+  readFileSync(path.join(__dirname, "../supported-resolutions.json"), "utf8"),
+) as SupportedResolution[];
+
+const k8sInstructions =
+  "Save the token to a file readable only by you. Set tokenFile in executor.yaml to that file’s path, then run Helmfile.";
+const k8sCommand =
+  "helmfile -f .helmfile/executor.helmfile.yaml.gotmpl -e dtu --state-values-file executor.yaml apply";
 
 // web-ui: Web UI manages team Executors and their one-time NATS tokens.
 // Behavior tests run at the supported desktop resolution (1440 x 900);
@@ -61,6 +83,36 @@ const tokenHeading = (page: Page, id: number) =>
     name: `One-time token for Executor ${id}`,
     exact: true,
   });
+
+async function expectKubernetesToken(page: Page, token: string) {
+  const view = page.locator("[data-executor-token]");
+  await expect(view.getByText(k8sInstructions, { exact: true })).toBeVisible();
+  await expect(view.locator("[data-token-value]")).toHaveText(token);
+  const command = view.locator("[data-token-command]");
+  await expect(command).toBeVisible();
+  await expect(command).toHaveText(k8sCommand);
+  await expect(command).not.toContainText(token);
+  return command;
+}
+
+async function copyToken(page: Page, token: string) {
+  const view = page.locator("[data-executor-token]");
+  const copy = view.getByRole("button", { name: "Copy", exact: true });
+  expect(
+    await copy.evaluate((button) => {
+      const label = document.createRange();
+      label.selectNodeContents(button);
+      return label.getClientRects().length;
+    }),
+  ).toBe(1);
+  await copy.click();
+  await expect(view.getByRole("status")).toHaveText(
+    "Token copied to the clipboard.",
+  );
+  await expect
+    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+    .toBe(token);
+}
 
 /** No token is kept anywhere the browser could show it again. */
 async function expectTokenGone(page: Page, token: string) {
@@ -132,19 +184,11 @@ test("v0048 operator creates an Executor with only tag and type and sees its tok
     await expect(view).toContainText(
       "Copy this token now. It cannot be shown again.",
     );
-    await expect(view).toContainText(
-      "Pass it to the Executor's Helm release at its first install.",
-    );
-    await expect(view).toContainText(
-      "helm upgrade --install … --set broker.token=jwt-created-token",
-    );
+    await expectKubernetesToken(page, "jwt-created-token");
     await expect(view).toContainText(
       "The chart stores the token in a Kubernetes Secret.",
     );
-    await view.getByRole("button", { name: "Copy", exact: true }).click();
-    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
-      "jwt-created-token",
-    );
+    await copyToken(page, "jwt-created-token");
     expect(page.url()).not.toContain("jwt-created-token");
   });
 
@@ -156,6 +200,9 @@ test("v0048 operator creates an Executor with only tag and type and sees its tok
       .locator("main")
       .getByRole("button", { name: "Copy", exact: true })
       .click();
+    await expect(
+      page.locator("[data-executor-token]").getByRole("status"),
+    ).toHaveText("Copy failed. Select the token and copy it manually.");
     await expect(page.locator("main")).not.toContainText(/copied/i);
   });
 
@@ -212,6 +259,7 @@ test("v0048 operator creates an Executor with only tag and type and sees its tok
       "executor_docker_openhands --token jwt-created-token",
     );
     await expect(view).not.toContainText("helm upgrade");
+    await expect(view).not.toContainText(k8sCommand);
   });
 });
 
@@ -248,9 +296,8 @@ test("v0048 operator reissues an Executor token after confirmation · Web UI uni
       method: "POST",
       path: `/ui/v1/teams/${TEAM}/executors/8/token`,
     });
-    await expect(page.locator("main")).toContainText(
-      "helm upgrade --install … --set broker.token=jwt-reissued-8",
-    );
+    await expectKubernetesToken(page, "jwt-reissued-8");
+    await copyToken(page, "jwt-reissued-8");
     await page
       .getByRole("button", { name: "Close and clear", exact: true })
       .click();
@@ -303,29 +350,100 @@ test("v0048 operator deletes an Executor by typing its decimal ID · Web UI unit
 });
 
 test("v0048 Executor create dialog and token view at every supported resolution and theme · Web UI unit", async ({
-  page,
+  browser,
 }) => {
   test.setTimeout(150_000);
-  await setup(page);
-  for (const { theme, width, height } of MATRIX)
-    await test.step(`${theme} ${width}`, async () => {
-      await usePresentation(page, theme, { width, height });
-      const dialog = await openCreate(page);
-      await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
-      await dialog
-        .getByLabel("Execution tag", { exact: true })
-        .fill("openhands");
-      await dialog
-        .getByRole("button", { name: "Create Executor", exact: true })
-        .click();
-      await expect(
-        page.getByRole("heading", {
-          name: /^One-time token for Executor \d+$/,
-        }),
-      ).toBeVisible();
-      await expectNoHorizontalScroll(page);
-      await page
-        .getByRole("button", { name: "Close and clear", exact: true })
-        .click();
+  const createdToken = "test-created-" + "x".repeat(160);
+  const reissuedToken = "test-reissued-" + "y".repeat(160);
+
+  for (const resolution of supportedResolutions) {
+    const { name, width, height, colorScheme, ...device } = resolution;
+    await test.step(name, async () => {
+      const context = await browser.newContext({
+        ...device,
+        viewport: { width, height },
+        colorScheme,
+      });
+      try {
+        const page = await context.newPage();
+        await usePresentation(page, colorScheme, { width, height });
+        const { executors } = await setup(page);
+        executors.createReply = () => ({
+          status: 201,
+          json: { token: createdToken },
+        });
+        executors.reissueReply = (id) => ({
+          status: 200,
+          json: { executor_id: id, token: reissuedToken },
+        });
+        const stream = await captureStreams(page);
+
+        for (const [action, id, token] of [
+          ["Create", 13, createdToken],
+          ["Reissue", 8, reissuedToken],
+        ] as const) {
+          await test.step(action, async () => {
+            if (action === "Create") {
+              const dialog = await openCreate(page);
+              await expect(page.locator("html")).toHaveAttribute("data-theme", colorScheme);
+              await dialog.getByLabel("Execution tag", { exact: true }).fill("openhands");
+              await dialog
+                .getByLabel("Executor type", { exact: true })
+                .selectOption("executor_k8s_openhands");
+              await dialog
+                .getByRole("button", { name: "Create Executor", exact: true })
+                .click();
+            } else {
+              await page.goto(`${proxy.baseUrl}/?view=executor&team=${TEAM}&id=${id}`);
+              await page
+                .getByRole("button", { name: "Reissue token", exact: true })
+                .click();
+              await page
+                .getByRole("dialog", { name: "Reissue token" })
+                .getByRole("button", { name: "Reissue token", exact: true })
+                .click();
+            }
+
+            const heading = tokenHeading(page, id);
+            await expect(heading).toBeVisible();
+            const beforeUpdate = await heading.elementHandle();
+            try {
+              await stream.send(event("executor_registered", 1, { executor_id: 7 }));
+              await expect
+                .poll(() => beforeUpdate.evaluate((node) => node.isConnected))
+                .toBe(false);
+            } finally {
+              await beforeUpdate.dispose();
+            }
+            await expect(heading).toBeVisible();
+            const command = await expectKubernetesToken(page, token);
+            await expectNoHorizontalScroll(page);
+            await copyToken(page, token);
+
+            // The install command is selectable independently of the Copy button.
+            await command.click();
+            await command.evaluate((element) => {
+              const selection = window.getSelection()!;
+              const range = document.createRange();
+              range.selectNodeContents(element);
+              selection.removeAllRanges();
+              selection.addRange(range);
+            });
+            await page.keyboard.press("Control+c");
+            await expect
+              .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+              .toBe(k8sCommand);
+
+            await page
+              .getByRole("button", { name: "Close and clear", exact: true })
+              .click();
+            await expect(heading).toHaveCount(0);
+            await expectTokenGone(page, token);
+          });
+        }
+      } finally {
+        await context.close();
+      }
     });
+  }
 });

@@ -4970,6 +4970,19 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
       .executor-token .source-copy-feedback:empty {
         display: none;
       }
+      .executor-token-k8s .command-text {
+        white-space: normal;
+      }
+      @media (min-width: 681px) {
+        .executor-token-k8s .secret-line .token-value {
+          flex: 1 1 auto;
+          min-width: 0;
+        }
+        .executor-token-k8s .secret-line [data-copy-token] {
+          flex: 0 0 auto;
+          white-space: nowrap;
+        }
+      }
       .task-timeline .attempt + .attempt {
         margin-top: 16px;
       }
@@ -14104,14 +14117,14 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
             subtitle.textContent = "Copy the one-time Executor token.";
           if (actions) actions.hidden = true;
           siblings.forEach((element) => (element.hidden = true));
-          slot.innerHTML = `<section class="panel executor-token" data-executor-token><div class="panel-head"><h2>One-time token for Executor ${id}</h2></div><p class="mini-meta">Executor ID <code>${id}</code></p><p class="notice">Copy this token now. It cannot be shown again.</p><div class="secret-line"><code class="token-value" data-token-value></code><button type="button" class="secondary" data-copy-token>Copy</button></div><p class="source-copy-feedback" role="status" data-copy-status></p>${
+          slot.innerHTML = `<section class="panel executor-token${k8s ? " executor-token-k8s" : ""}" data-executor-token><div class="panel-head"><h2>One-time token for Executor ${id}</h2></div><p class="mini-meta">Executor ID <code>${id}</code></p><p class="notice">Copy this token now. It cannot be shown again.</p><div class="secret-line"><code class="token-value" data-token-value></code><button type="button" class="secondary" data-copy-token>Copy</button></div><p class="source-copy-feedback" role="status" data-copy-status></p>${
             k8s
-              ? `<p>Pass it to the Executor's Helm release at its first install.</p><div class="command-line"><code class="command-text" data-token-command></code></div><p class="supporting">The chart stores the token in a Kubernetes Secret.</p>`
+              ? `<p>Save the token to a file readable only by you. Set tokenFile in executor.yaml to that file’s path, then run Helmfile.</p><div class="command-line"><code class="command-text" data-token-command></code></div><p class="supporting">The chart stores the token in a Kubernetes Secret.</p>`
               : `<p>Pass it to the Executor with <code>--token</code> at its first start.</p><div class="command-line"><code class="command-text" data-token-command></code></div>`
           }<div class="page-action"><button type="button" class="secondary" data-token-clear>Close and clear</button></div></section>`;
           slot.querySelector("[data-token-value]").textContent = token;
           slot.querySelector("[data-token-command]").textContent = k8s
-            ? `helm upgrade --install … --set broker.token=${token}`
+            ? `helmfile -f .helmfile/executor.helmfile.yaml.gotmpl -e dtu --state-values-file executor.yaml apply`
             : `${executor.executor_type || "executor_docker_openhands"} --token ${token}`;
           const status = slot.querySelector("[data-copy-status]");
           slot.querySelector("[data-copy-token]").onclick = async () => {
