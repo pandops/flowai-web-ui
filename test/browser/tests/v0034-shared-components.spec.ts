@@ -380,10 +380,13 @@ test("v0034.12 task fields use a fitting two-line table before stacked records",
   await flowFixture(page);
   const sourceID = 8013;
   const taskID = 8027;
+  // Keep the mock name within two lines with both Noto and Ubuntu's
+  // DejaVu fallback. Longer names legitimately switch this view to cards.
+  const sourceName = "Customer help intake";
   await page.route("**/ui/v1/sources?**", (route) =>
     route.fulfill({
       json: {
-        items: [{ source_id: sourceID, name: "Customer support intake" }],
+        items: [{ source_id: sourceID, name: sourceName }],
         next_cursor: null,
       },
     }),
@@ -467,7 +470,7 @@ test("v0034.12 task fields use a fitting two-line table before stacked records",
     "task-fields-fit-two-lines",
   );
   for (const value of [
-    "Customer support intake",
+    sourceName,
     "Daily customer response",
     "customer event 42",
   ])
@@ -481,7 +484,7 @@ test("v0034.12 task fields use a fitting two-line table before stacked records",
   await expect(collection.locator(":scope > table")).toBeHidden();
   await expect(collection.locator(":scope > .cards")).toBeVisible();
   for (const value of [
-    "Customer support intake",
+    sourceName,
     "Daily customer response",
     "customer event 42",
   ])

@@ -3,6 +3,7 @@ import type { Page } from "@playwright/test";
 import { expect, test } from "../fixtures/owned-test";
 import {
   openSourceCommand,
+  sourceActionsTrigger,
   sourceDialog,
   type SourceCommand,
 } from "../fixtures/approved-dialogs";
@@ -897,21 +898,30 @@ test("adversary CJM / delayed Source settings cannot reopen prior-team Flow edit
               .getByRole("link", { name: "catalog-sentinel", exact: true })
               .first(),
           ).toBeVisible();
-          for (const expansion of await root
-            .locator('button[aria-expanded="false"],summary')
-            .all()) {
-            if (await expansion.isVisible()) {
-              expect
-                .soft(
-                  (await expansion.boundingBox())?.height,
-                  "catalog details expansion touch target",
-                )
-                .toBeGreaterThanOrEqual(44);
-              await expansion.click();
-            }
+          // Each Source renders a table and card trigger. Resolve the visible
+          // trigger by Source name so opening one menu cannot renumber the rest.
+          for (const { name } of world.sources.values()) {
+            const expansion = sourceActionsTrigger(page, name);
+            await expect(expansion).toBeVisible();
+            await expect(expansion).toHaveAttribute("aria-expanded", "false");
+            expect
+              .soft(
+                (await expansion.boundingBox())?.height,
+                "catalog actions expansion touch target",
+              )
+              .toBeGreaterThanOrEqual(44);
+            await expansion.click();
+            await expect(expansion).toHaveAttribute("aria-expanded", "true");
+            await expect(
+              root.getByRole("menu", {
+                name: `Actions for ${name}`,
+                exact: true,
+              }),
+            ).toBeVisible();
+            await page.keyboard.press("Escape");
+            await expect(expansion).toHaveAttribute("aria-expanded", "false");
           }
           const content = await root.innerText();
-          await page.keyboard.press("Escape");
           await root
             .getByRole("link", { name: "catalog-sentinel", exact: true })
             .first()
