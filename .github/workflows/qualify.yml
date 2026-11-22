@@ -313,9 +313,9 @@ jobs:
             {
               git ls-tree -r "$source" -- "${paths[@]}" | sed '/_test\.go$/d' || return
               workflow_json "$source" .github/workflows/qualify.yml |
-                jq -ce '.jobs.application as $job | [$job."runs-on", $job.env.GOTOOLCHAIN, $job.env.GOWORK, ($job.steps[] | select((.uses // "") | startswith("actions/setup-go@")) | {uses,with}), ($job.steps[] | select(.id == "compile") | {shell,run,env})] | select(length == 5)' || return
+                jq -ce '.jobs as $jobs | $jobs.application as $job | [$job."runs-on", $job.env.GOTOOLCHAIN, $job.env.GOWORK, $jobs.container.with.runtime_files, ($job.steps[] | select((.uses // "") | startswith("actions/setup-go@")) | {uses,with}), ($job.steps[] | select(.id == "compile") | {shell,run,env})] | select(length == 6)' || return
               workflow_json "$source" .github/workflows/v0052-build-push.yml |
-                jq -ce '.jobs.publish as $job | [$job."runs-on", ($job.steps[] | select(.id == "assemble") | {shell,run,env})] | select(length == 2)' || return
+                jq -ce '. as $workflow | .jobs.publish as $job | ($job.steps | map(.id) | index("assemble")) as $assemble | select($assemble != null) | {runner:$job."runs-on", defaults:$workflow.defaults, env:$workflow.env, job_defaults:$job.defaults, job_env:$job.env, steps:$job.steps[:($assemble + 1)]}' || return
             } | sha256sum | cut -d ' ' -f1
           }
           identity="$(production_tree "$GITHUB_SHA")"
