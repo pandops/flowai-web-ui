@@ -69,8 +69,16 @@ jobs:
         shell: bash
         run: |
           mkdir "$RUNNER_TEMP/application"
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=readonly -buildvcs=false -trimpath \
-            -ldflags='-s -w' -o "$RUNNER_TEMP/application/app" ./cmd/web-ui
+          source="$RUNNER_TEMP/application-source"
+          mkdir "$source"
+          git archive --format=tar "$GITHUB_SHA" | tar -xf - -C "$source"
+          (
+            cd "$source"
+            env -i PATH="$PATH" HOME="$HOME" GOENV=off GOTOOLCHAIN=local GOWORK=off \
+              CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v1 \
+              go build -mod=readonly -buildvcs=false -trimpath -ldflags='-s -w' \
+                -o "$RUNNER_TEMP/application/app" ./cmd/web-ui
+          )
           checksum="$(sha256sum "$RUNNER_TEMP/application/app")"
           printf 'sha256=%s\n' "${checksum%% *}" >> "$GITHUB_OUTPUT"
 
@@ -301,7 +309,7 @@ jobs:
         shell: bash
         env:
           REUSE_PIN: ${{ inputs.reuse_image }}
-          PRODUCTION_PATHS: "[\"Containerfile.runtime\",\"cmd\",\"internal\",\"go.mod\",\"go.sum\",\"schemas\",\"web\"]"
+          PRODUCTION_PATHS: "[\".gitattributes\",\"Containerfile.runtime\",\"cmd\",\"internal\",\"go.mod\",\"go.sum\",\"schemas\",\"web\"]"
           INITIAL_IMPORT: "Extract standalone Web UI service"
         run: |
           mapfile -t paths < <(jq -er '.[]' <<< "$PRODUCTION_PATHS")
@@ -313,7 +321,7 @@ jobs:
             {
               git ls-tree -r "$source" -- "${paths[@]}" | sed '/_test\.go$/d' || return
               workflow_json "$source" .github/workflows/qualify.yml |
-                jq -ce '.jobs as $jobs | $jobs.application as $job | [$job."runs-on", $job.env.GOTOOLCHAIN, $job.env.GOWORK, $jobs.container.with.runtime_files, ($job.steps[] | select((.uses // "") | startswith("actions/setup-go@")) | {uses,with}), ($job.steps[] | select(.id == "compile") | {shell,run,env})] | select(length == 6)' || return
+                jq -ce '. as $workflow | .jobs as $jobs | $jobs.application as $job | ($job.steps | map(select((.uses // "") | startswith("actions/setup-go@")) | {uses,with})) as $toolchains | ($job.steps | map(select(.id == "compile") | {shell,run,env})) as $compilers | select(($toolchains | length) == 1 and ($compilers | length) == 1) | {runner:$job."runs-on", defaults:$workflow.defaults, env:$workflow.env, job_defaults:$job.defaults, job_env:$job.env, runtime_files:$jobs.container.with.runtime_files, toolchain:$toolchains[0], compiler:$compilers[0]}' || return
               workflow_json "$source" .github/workflows/v0052-build-push.yml |
                 jq -ce '. as $workflow | .jobs.publish as $job | ($job.steps | map(.id) | index("assemble")) as $assemble | select($assemble != null) | {runner:$job."runs-on", defaults:$workflow.defaults, env:$workflow.env, job_defaults:$job.defaults, job_env:$job.env, steps:$job.steps[:($assemble + 1)]}' || return
             } | sha256sum | cut -d ' ' -f1
