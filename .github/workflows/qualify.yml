@@ -303,13 +303,19 @@ jobs:
           REUSE_PIN: ${{ inputs.reuse_image }}
           PRODUCTION_PATHS: "[\"Containerfile.runtime\",\"cmd\",\"internal\",\"go.mod\",\"go.sum\",\"schemas\",\"web\"]"
           INITIAL_IMPORT: "Extract standalone Web UI service"
-          BUILD_RECIPE: "go1.26.2 CGO_ENABLED=0 linux/amd64 -mod=readonly -buildvcs=false -trimpath -ldflags=-s -w"
         run: |
           mapfile -t paths < <(jq -er '.[]' <<< "$PRODUCTION_PATHS")
+          workflow_json() {
+            git show "$1:$2" | yq -p yaml -o json '.'
+          }
           production_tree() {
+            local source="$1"
             {
-              git ls-tree -r "$1" -- "${paths[@]}" | sed '/_test\.go$/d'
-              printf '%s\n' "$BUILD_RECIPE"
+              git ls-tree -r "$source" -- "${paths[@]}" | sed '/_test\.go$/d' || return
+              workflow_json "$source" .github/workflows/qualify.yml |
+                jq -ce '.jobs.application as $job | [$job."runs-on", $job.env.GOTOOLCHAIN, $job.env.GOWORK, ($job.steps[] | select((.uses // "") | startswith("actions/setup-go@")) | {uses,with}), ($job.steps[] | select(.id == "compile") | {shell,run,env})] | select(length == 5)' || return
+              workflow_json "$source" .github/workflows/v0052-build-push.yml |
+                jq -ce '.jobs.publish as $job | [$job."runs-on", ($job.steps[] | select(.id == "assemble") | {shell,run,env})] | select(length == 2)' || return
             } | sha256sum | cut -d ' ' -f1
           }
           identity="$(production_tree "$GITHUB_SHA")"

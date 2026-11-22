@@ -54,8 +54,10 @@ jobs:
           VERSION: ${{ inputs.version }}
           REUSE_DIGEST: ${{ inputs.reuse_digest }}
           BUILD_SOURCE: ${{ inputs.build_source_revision }}
+          PRODUCTION_IDENTITY: ${{ inputs.production_identity }}
           QUALIFICATION: ${{ inputs.qualification }}
         run: |
+          [[ "$PRODUCTION_IDENTITY" =~ ^sha256:[a-f0-9]{64}$ ]]
           if [[ -n "$REUSE_DIGEST" ]]; then
             [[ "$REUSE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ && "$BUILD_SOURCE" =~ ^[a-f0-9]{40}$ ]]
             [[ -z "$BINARY_ID" && -z "$BINARY_SHA256" ]]
@@ -110,7 +112,7 @@ jobs:
           temp = Path(os.environ["RUNNER_TEMP"])
           qualified = temp / "qualified"
           app, = qualified.iterdir()
-          assert re.fullmatch(r"app-[1-9][0-9]*", app.name)
+          assert re.fullmatch(r"app(?:-[1-9][0-9]*)?", app.name)
           assert app.is_file() and not app.is_symlink()
           with app.open("rb") as stream:
               assert hashlib.file_digest(stream, "sha256").hexdigest() == os.environ["BINARY_SHA256"]
@@ -171,12 +173,40 @@ jobs:
               os.utime(path, (0, 0))
           PY
 
-      - name: Build and publish the immutable runtime image
+      - name: Assemble the immutable runtime image
+        if: inputs.reuse_digest == ''
+        id: assemble
+        env:
+          VERSION: ${{ inputs.version }}
+          PRODUCTION_IDENTITY: ${{ inputs.production_identity }}
+        run: |
+          tag="ghcr.io/$GITHUB_REPOSITORY:$VERSION"
+          docker build --platform linux/amd64 --network none --build-arg SOURCE_DATE_EPOCH=0 \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "io.flowai.production-inputs=$PRODUCTION_IDENTITY" \
+            --tag "$tag" --file "$RUNNER_TEMP/runtime/Containerfile" "$RUNNER_TEMP/runtime"
+          [[ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$tag")" == linux/amd64 ]]
+          config="$(docker image inspect --format '{{.Id}}' "$tag")"
+          [[ "$config" =~ ^sha256:[a-f0-9]{64}$ ]]
+          docker image inspect --format '{{json .Config.Labels}}' "$config" |
+            jq -e --arg source "https://github.com/$GITHUB_REPOSITORY" --arg revision "$GITHUB_SHA" \
+              --arg version "$VERSION" --arg identity "$PRODUCTION_IDENTITY" '
+              .["org.opencontainers.image.source"] == $source and
+              .["org.opencontainers.image.revision"] == $revision and
+              .["org.opencontainers.image.version"] == $version and
+              .["io.flowai.production-inputs"] == $identity
+            ' >/dev/null
+          printf 'config_digest=%s\n' "$config" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the assembled runtime image
         if: inputs.reuse_digest == ''
         id: publish
         env:
           GHCR_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
+          CONFIG_DIGEST: ${{ steps.assemble.outputs.config_digest }}
         run: |
           state="$(mktemp -d "$RUNNER_TEMP/registry.XXXXXX")"
           export DOCKER_CONFIG="$state/docker"
@@ -184,14 +214,9 @@ jobs:
           image="ghcr.io/$GITHUB_REPOSITORY"
           tag="$image:$VERSION"
           media='application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
-          docker build --platform linux/amd64 --network none --build-arg SOURCE_DATE_EPOCH=0 \
-            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
-            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
-            --label "org.opencontainers.image.version=$VERSION" \
-            --tag "$tag" --file "$RUNNER_TEMP/runtime/Containerfile" "$RUNNER_TEMP/runtime"
-          [[ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$tag")" == linux/amd64 ]]
-          config="$(docker image inspect --format '{{.Id}}' "$tag")"
+          config="$CONFIG_DIGEST"
           [[ "$config" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$(docker image inspect --format '{{.Id}}' "$tag")" == "$config" ]]
 
           scope="scope=repository:$GITHUB_REPOSITORY:pull"
           token="$(printf 'user = "%s:%s"\n' "$GITHUB_ACTOR" "$GHCR_TOKEN" |
@@ -251,20 +276,53 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           DIGEST: ${{ inputs.reuse_digest }}
+          BUILD_SOURCE: ${{ inputs.build_source_revision }}
+          PRODUCTION_IDENTITY: ${{ inputs.production_identity }}
         run: |
           state="$(mktemp -d "$RUNNER_TEMP/reuse.XXXXXX")"
           image="ghcr.io/$GITHUB_REPOSITORY"
+          base="https://ghcr.io/v2/$GITHUB_REPOSITORY"
           scope="scope=repository:$GITHUB_REPOSITORY:pull"
-          token="$(curl -q -fsS --max-time 30 --get https://ghcr.io/token             --data-urlencode service=ghcr.io --data-urlencode "$scope" | jq -er .token)"
+          token="$(curl -q -fsS --max-time 30 --get https://ghcr.io/token \
+            --data-urlencode service=ghcr.io --data-urlencode "$scope" | jq -er .token)"
           [[ "$token" =~ ^[A-Za-z0-9_.=+/-]+$ ]]
           printf '::add-mask::%s\n' "$token"
           media='application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
-          for locator in "$VERSION" "$DIGEST"; do
-            status="$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
-              curl -q --config - -sS --max-time 30 -H "Accept: $media"                 -o "$state/manifest" -w '%{http_code}' "https://ghcr.io/v2/$GITHUB_REPOSITORY/manifests/$locator")"
-            [[ "$status" == 200 ]]
-            printf '%s  %s\n' "${DIGEST#sha256:}" "$state/manifest" | sha256sum --check
-          done
+          ghcr_get() {
+            printf 'header = "Authorization: Bearer %s"\n' "$token" |
+              curl -q --config - -fsS --location --max-redirs 3 --proto '=https' --proto-redir '=https' \
+                --max-time 30 --max-filesize 4194304 "$@"
+          }
+          verify_digest() { printf '%s  %s\n' "${1#sha256:}" "$2" | sha256sum --check; }
+
+          ghcr_get -H "Accept: $media" -o "$state/manifest" "$base/manifests/$DIGEST"
+          verify_digest "$DIGEST" "$state/manifest"
+          ghcr_get -H "Accept: $media" -o "$state/version" "$base/manifests/$VERSION"
+          cmp "$state/manifest" "$state/version"
+
+          config="$(jq -er '
+            select(.schemaVersion == 2 and (.layers | type == "array"))
+            | select(
+                (.mediaType == "application/vnd.oci.image.manifest.v1+json" and
+                 .config.mediaType == "application/vnd.oci.image.config.v1+json") or
+                (.mediaType == "application/vnd.docker.distribution.manifest.v2+json" and
+                 .config.mediaType == "application/vnd.docker.container.image.v1+json"))
+            | .config.digest | select(test("^sha256:[a-f0-9]{64}$"))
+          ' "$state/manifest")"
+          ghcr_get -o "$state/config" "$base/blobs/$config"
+          verify_digest "$config" "$state/config"
+          if ! jq -e --arg source "https://github.com/$GITHUB_REPOSITORY" --arg revision "$BUILD_SOURCE" \
+            --arg version "$VERSION" --arg identity "$PRODUCTION_IDENTITY" '
+            .os == "linux" and .architecture == "amd64" and
+            (.config.Labels |
+              .["org.opencontainers.image.source"] == $source and
+              .["org.opencontainers.image.revision"] == $revision and
+              .["org.opencontainers.image.version"] == $version and
+              .["io.flowai.production-inputs"] == $identity)
+          ' "$state/config" >/dev/null; then
+            echo "Reuse refused: image config must be linux/amd64 and match source, revision, version and production inputs." >&2
+            exit 1
+          fi
           DOCKER_CONFIG="$state" docker pull --platform linux/amd64 "$image@$DIGEST"
           printf 'image_ref=%s@%s\n' "$image" "$DIGEST" >> "$GITHUB_OUTPUT"
 
@@ -321,8 +379,10 @@ jobs:
           if [[ -n "$REUSE_DIGEST" ]]; then
             [[ "$digest" == "$REUSE_DIGEST" ]]
           fi
-          jq -ecn --arg repo "$GITHUB_REPOSITORY" --arg source "$GITHUB_SHA"             --arg buildSource "${BUILD_SOURCE:-$GITHUB_SHA}" --arg build "$build" \
-            --arg version "$VERSION" --arg digest "$digest" --argjson qualification "$QUALIFICATION"             --arg workflow "$workflow" --argjson run "$GITHUB_RUN_ID" '
+          jq -ecn --arg repo "$GITHUB_REPOSITORY" --arg source "$GITHUB_SHA" \
+            --arg buildSource "${BUILD_SOURCE:-$GITHUB_SHA}" --arg build "$build" \
+            --arg version "$VERSION" --arg digest "$digest" --argjson qualification "$QUALIFICATION" \
+            --arg workflow "$workflow" --argjson run "$GITHUB_RUN_ID" '
             $qualification
             | select(keys == ["integration","schemaInputs","unit"] and (.schemaInputs | type == "array"))
             | select(all(.unit, .integration; IN("success", "not-applicable")))
