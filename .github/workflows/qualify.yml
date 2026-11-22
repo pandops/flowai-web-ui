@@ -1,43 +1,46 @@
-name: Qualify Web UI
-run-name: Qualify web-ui at ${{ inputs.expected_source_sha }}
-
+name: Qualify and publish web-ui
 on:
   workflow_dispatch:
     inputs:
       expected_source_sha:
-        description: Full commit SHA of the selected Web UI ref
+        description: Selected application commit
         type: string
         required: true
+      reuse_image:
+        description: Existing qualified image pin as JSON when production inputs are unchanged
+        type: string
+        required: false
 
 permissions:
   contents: read
 
 jobs:
-  qualify:
+  application:
+    name: Build and test the application
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 45
     env:
       EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
       GOTOOLCHAIN: local
       GOWORK: 'off'
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      stage: ${{ steps.version.outputs.stage }}
+      production_identity: ${{ steps.version.outputs.production_identity }}
+      reuse_digest: ${{ steps.version.outputs.reuse_digest }}
+      build_source_revision: ${{ steps.version.outputs.build_source_revision }}
+      binary_artifact_id: ${{ steps.binary.outputs.artifact-id }}
+      binary_sha256: ${{ steps.compile.outputs.sha256 }}
     steps:
-      - name: Verify dispatch SHA
+      - name: Bind qualification to the selected commit
         shell: bash
         run: |
-          [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$GITHUB_SHA" == "$EXPECTED_SOURCE_SHA" ]]
-
+          [[ "$EXPECTED_SOURCE_SHA" == "$GITHUB_SHA" ]]
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
-
-      - name: Verify candidate checkout
-        shell: bash
-        run: |
-          [[ "$(git rev-parse HEAD)" == "$EXPECTED_SOURCE_SHA" ]]
-          test -f go.mod
-          test -f test/browser/package-lock.json
 
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
@@ -61,20 +64,26 @@ jobs:
           node node_modules/playwright/cli.js --version
           node node_modules/playwright/cli.js install --with-deps chromium
 
-      - name: Build untagged Linux amd64 artifact
-        run: |
-          docker build --platform linux/amd64 -f Containerfile --iidfile "$RUNNER_TEMP/web-ui.iid" .
-          cat "$RUNNER_TEMP/web-ui.iid"
-
-      - name: Browser unit tests against the built image
-        working-directory: test/browser
+      - name: Build the Linux application binary
+        id: compile
         shell: bash
         run: |
-          if [[ "${GITHUB_ACTIONS:-}" != true || "${RUNNER_ENVIRONMENT:-}" != github-hosted ]]; then
-            echo 'Run this entry point on a dedicated GitHub-hosted job.' >&2
-            exit 1
-          fi
-          image_id="$(cat "$RUNNER_TEMP/web-ui.iid")"
+          mkdir "$RUNNER_TEMP/application"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=readonly -buildvcs=false -trimpath \
+            -ldflags='-s -w' -o "$RUNNER_TEMP/application/app" ./cmd/web-ui
+          checksum="$(sha256sum "$RUNNER_TEMP/application/app")"
+          printf 'sha256=%s\n' "${checksum%% *}" >> "$GITHUB_OUTPUT"
+
+      - name: Browser unit tests against the qualified binary
+        working-directory: test/browser
+        shell: bash
+        env:
+          HARNESS_IMAGE: docker.io/library/golang:1.26.2-alpine@sha256:f85330846cde1e57ca9ec309382da3b8e6ae3ab943d2739500e08c86393a21b1
+        run: |
+          binary="$RUNNER_TEMP/application/app"
+          digest="$(sha256sum "$binary")"
+          docker pull --platform linux/amd64 "$HARNESS_IMAGE"
+          image_id="$(docker image inspect --format '{{.Id}}' "$HARNESS_IMAGE")"
           [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$(docker image inspect --format '{{.Id}}' "$image_id")" == "$image_id" ]]
 
@@ -190,7 +199,8 @@ jobs:
 
           container_id="$(docker create --pull=never --name "$owner" \
             --label "flowai.web-ui.qualification=$owner" \
-            --publish 127.0.0.1::8080 "$image_id")"
+            --mount "type=bind,source=$binary,target=/fixture/web-ui,readonly" \
+            --entrypoint /fixture/web-ui --publish 127.0.0.1::8080 "$image_id")"
           [[ "$container_id" =~ ^[0-9a-f]{64}$ ]]
           [[ "$(docker inspect --format '{{.Image}}' "$container_id")" == "$image_id" ]]
           docker start "$container_id" >/dev/null
@@ -201,6 +211,7 @@ jobs:
           echo
 
           FLOWAI_WEB_UI_ORIGIN="$origin" FLOWAI_WEB_UI_IMAGE_ID="$image_id" \
+            FLOWAI_WEB_UI_BINARY_DIGEST="sha256:${digest%% *}" \
             FLOWAI_BROWSER_NATIVE_TMP="$browser_root" FLOWAI_BROWSER_OWNER="$browser_root" \
             TMPDIR="$browser_root" TMP="$browser_root" TEMP="$browser_root" \
             node node_modules/playwright/cli.js test --workers=1 --retries=0 &
@@ -259,191 +270,143 @@ jobs:
           }
           BROWSER_REPORT
           if (( browser_status != 0 )); then exit "$browser_status"; fi
+          [[ "$(sha256sum "$binary")" == "$digest" ]]
+          printf 'Browser-qualified Web UI binary sha256:%s\n' "${digest%% *}"
           exit "$report_status"
 
-      - name: Verify runner-local image after tests
-        run: |
-          iid="$(cat "$RUNNER_TEMP/web-ui.iid")"
-          [[ "$(docker image inspect --format '{{.Id}}' "$iid")" == "$iid" ]]
-          [[ "$(docker image inspect --format '{{len .RepoTags}}' "$iid")" == 0 ]]
-          echo "Qualified runner-local Web UI OCI config ID $iid"
+      - name: Prepare the binary from this attempt
+        if: ${{ inputs.reuse_image == '' }}
+        shell: bash
+        run: mv "$RUNNER_TEMP/application/app" "$RUNNER_TEMP/application/app-$GITHUB_RUN_ATTEMPT"
 
-      - name: Export the tested image as OCI
+      - name: Retain the application binary
+        id: binary
+        if: ${{ inputs.reuse_image == '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: app-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/application/app-${{ github.run_attempt }}
+          archive: false
+          retention-days: 7
+          if-no-files-found: error
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        if: ${{ inputs.reuse_image == '' }}
+        with:
+          node-version: '24.20.0'
+          package-manager-cache: false
+
+      - name: Resolve the artifact version
+        id: version
         shell: bash
         env:
-          SKOPEO: quay.io/skopeo/stable@sha256:8342e1e8d7b12d0bd3bf53ce8f4fde7ed876277aa8e4345f53937a505309e6b5
+          REUSE_PIN: ${{ inputs.reuse_image }}
+          PRODUCTION_PATHS: "[\"Containerfile.runtime\",\"cmd\",\"internal\",\"go.mod\",\"go.sum\",\"schemas\",\"web\"]"
+          INITIAL_IMPORT: "Extract standalone Web UI service"
+          BUILD_RECIPE: "go1.26.2 CGO_ENABLED=0 linux/amd64 -mod=readonly -buildvcs=false -trimpath -ldflags=-s -w"
         run: |
-          iid="$(cat "$RUNNER_TEMP/web-ui.iid")"
-          [[ "$iid" =~ ^sha256:[0-9a-f]{64}$ ]]
-          export_dir="$(mktemp -d "$RUNNER_TEMP/web-ui-export.XXXXXXXX")"
-          trap 'rm -rf -- "$export_dir"' EXIT
-          mkdir "$RUNNER_TEMP/oci" "$export_dir/layout"
-          docker image save --output "$export_dir/tested.docker.tar" "$iid"
-          python3 - "$export_dir/tested.docker.tar" "$iid" > "$RUNNER_TEMP/web-ui-source-docker-config.json" <<'DOCKER_CONFIG'
-          import hashlib
-          import json
-          import re
-          import sys
-          import tarfile
-
-          archive_path, iid = sys.argv[1:]
-          with tarfile.open(archive_path) as archive:
-              members = archive.getmembers()
-
-              def read_member(name):
-                  entry, = [member for member in members if member.name == name]
-                  if not entry.isfile():
-                      raise ValueError("Docker archive config or manifest is not a regular file")
-                  return archive.extractfile(entry).read()
-
-              image, = json.loads(read_member("manifest.json"))
-              path = image["Config"]
-              if not re.fullmatch(r"(?:blobs/sha256/[0-9a-f]{64}|[0-9a-f]{64}\.json)", path):
-                  raise ValueError("Unexpected Docker image config path")
-              config = read_member(path)
-              if "sha256:" + hashlib.sha256(config).hexdigest() != iid:
-                  raise ValueError("Docker archive config differs from the browser-tested image ID")
-              sys.stdout.buffer.write(config)
-          DOCKER_CONFIG
-          echo "Verified Docker archive config raw digest $iid"
-
-          skopeo=(docker run --rm --network none --platform linux/amd64 --entrypoint /usr/bin/skopeo
-            --user "$(id -u):$(id -g)" --env HOME=/tmp
-            --volume "$export_dir/tested.docker.tar:/tested.docker.tar:ro")
-          "${skopeo[@]}" "$SKOPEO" inspect --config docker-archive:/tested.docker.tar \
-            > "$RUNNER_TEMP/web-ui-source-oci-config.json"
-          "${skopeo[@]}" --volume "$export_dir/layout:/layout" "$SKOPEO" \
-            copy --format oci docker-archive:/tested.docker.tar oci:/layout
-          tar --format=ustar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
-            -cf "$RUNNER_TEMP/oci/image.oci.tar" -C "$export_dir/layout" oci-layout index.json blobs
-
-      - name: Verify OCI layout and digests
-        id: oci
-        shell: bash
-        run: |
-          evidence="$RUNNER_TEMP/oci"
-          archive="$evidence/image.oci.tar"
-          layout="$(mktemp -d "$RUNNER_TEMP/web-ui-layout.XXXXXXXX")"
-          trap 'rm -rf -- "$layout"' EXIT
-          tar --quoting-style=escape -tf "$archive" > "$layout/paths"
-          [[ -z "$(sort "$layout/paths" | uniq -d)" ]]
-          awk '
-            /^(oci-layout|index[.]json|blobs\/(sha256\/)?)$/ { next }
-            /^blobs\/sha256\/[0-9a-f]+$/ && length($0) == 77 { next }
-            { exit 1 }
-          ' "$layout/paths"
-          tar --quoting-style=escape -tvf "$archive" | awk '
-            /^-.* (oci-layout|index[.]json|blobs\/sha256\/[0-9a-f]+)$/ { next }
-            /^d.* blobs(\/sha256)?\/$/ { next }
-            { exit 1 }
-          '
-          mkdir "$layout/extracted"
-          tar -xf "$archive" -C "$layout/extracted" --no-same-owner --no-same-permissions
-          cd "$evidence"
-          sha256sum image.oci.tar | tee SHA256SUMS
-          node --input-type=module - "$layout/extracted" "$(cat "$RUNNER_TEMP/web-ui.iid")" <<'OCI_CHECK'
-          import assert from "node:assert/strict";
-          import { createHash } from "node:crypto";
-          import { createReadStream, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-          import { join } from "node:path";
-          import { pipeline } from "node:stream/promises";
-          import { createGunzip, createZstdDecompress } from "node:zlib";
-
-          const [layout, iid] = process.argv.slice(2);
-          const sha256 = /^sha256:[0-9a-f]{64}$/;
-          const oci = "application/vnd.oci.image.";
-          const readJSON = (path) => JSON.parse(readFileSync(path, "utf8"));
-          const index = readJSON(join(layout, "index.json"));
-          assert.equal(readJSON(join(layout, "oci-layout")).imageLayoutVersion, "1.0.0");
-          assert.equal(index.schemaVersion, 2);
-          assert.equal(index.manifests.length, 1);
-          const [image] = index.manifests;
-          assert.equal(image.mediaType, oci + "manifest.v1+json");
-
-          const blobs = join(layout, "blobs", "sha256");
-          const referenced = new Set();
-          async function verifyBlob(descriptor) {
-            assert.match(descriptor.digest, sha256);
-            const hex = descriptor.digest.slice(7);
-            const path = join(blobs, hex);
-            assert.equal(statSync(path).size, descriptor.size, "OCI blob size mismatch");
-            const hash = createHash("sha256");
-            await pipeline(createReadStream(path), hash);
-            assert.equal(hash.digest("hex"), hex, "OCI blob digest mismatch");
-            referenced.add(hex);
-            return path;
+          mapfile -t paths < <(jq -er '.[]' <<< "$PRODUCTION_PATHS")
+          production_tree() {
+            {
+              git ls-tree -r "$1" -- "${paths[@]}" | sed '/_test\.go$/d'
+              printf '%s\n' "$BUILD_RECIPE"
+            } | sha256sum | cut -d ' ' -f1
           }
+          identity="$(production_tree "$GITHUB_SHA")"
+          printf 'production_identity=sha256:%s\n' "$identity" >> "$GITHUB_OUTPUT"
+          release_branch="$GITHUB_REF_NAME"
+          stable='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          version_pattern="^${stable}$"
+          stage=stable
+          if [[ "$release_branch" != master ]]; then
+            stage=snapshot
+            # Give each distinct input set its own prerelease channel. This
+            # also separates it from the earlier pilot snapshots in GHCR.
+            channel="snapshot-${identity:0:16}"
+            release_branch="$channel"
+            version_pattern="^${stable}-${channel}\.[1-9][0-9]*$"
+          fi
+          printf 'stage=%s\n' "$stage" >> "$GITHUB_OUTPUT"
 
-          const manifest = readJSON(await verifyBlob(image));
-          assert.equal(manifest.schemaVersion, 2);
-          if (manifest.mediaType !== undefined) assert.equal(manifest.mediaType, image.mediaType);
-          assert.equal(manifest.config.mediaType, oci + "config.v1+json");
-          const config = readJSON(await verifyBlob(manifest.config));
-          const sourceOCIConfig = readJSON(join(process.env.RUNNER_TEMP, "web-ui-source-oci-config.json"));
-          const sourceDockerConfig = readJSON(join(process.env.RUNNER_TEMP, "web-ui-source-docker-config.json"));
-          assert.deepEqual(config, sourceOCIConfig, "OCI config differs from the normalized tested Docker config");
-          assert.deepEqual(config.rootfs, sourceDockerConfig.rootfs, "OCI rootfs differs from the tested Docker config");
-          assert.equal(config.os, sourceDockerConfig.os);
-          assert.equal(config.architecture, sourceDockerConfig.architecture);
-          assert.equal(config.os + "/" + config.architecture, "linux/amd64");
-          assert.equal(config.rootfs.type, "layers");
-          assert.ok(manifest.layers.length > 0);
-          assert.equal(manifest.layers.length, config.rootfs.diff_ids.length);
-          for (const [i, layer] of manifest.layers.entries()) {
-            const path = await verifyBlob(layer);
-            const diffID = config.rootfs.diff_ids[i];
-            switch (layer.mediaType) {
-              case oci + "layer.v1.tar":
-                assert.equal(layer.digest, diffID, "OCI layer differs from the tested root filesystem");
-                break;
-              case oci + "layer.v1.tar+gzip":
-              case oci + "layer.v1.tar+zstd": {
-                const decoder = layer.mediaType.endsWith("+gzip") ? createGunzip() : createZstdDecompress();
-                const hash = createHash("sha256");
-                await pipeline(createReadStream(path), decoder, hash);
-                assert.equal("sha256:" + hash.digest("hex"), diffID, "OCI layer differs from the tested root filesystem");
-                break;
-              }
-              default:
-                throw new Error("Unexpected OCI layer media type: " + layer.mediaType);
-            }
-          }
-          assert.deepEqual(readdirSync(blobs).sort(), [...referenced].sort());
+          if [[ -n "$REUSE_PIN" ]]; then
+            build_source="$(jq -er '.buildSourceRevision | select(test("^[a-f0-9]{40}$"))' <<< "$REUSE_PIN")"
+            digest="$(jq -er '.imageDigest | select(test("^sha256:[a-f0-9]{64}$"))' <<< "$REUSE_PIN")"
+            version="$(jq -er .version <<< "$REUSE_PIN")"
+            [[ "$(production_tree "$build_source")" == "$identity" ]]
+            if [[ "$stage" == stable ]]; then
+              [[ "$version" =~ ^${stable}$ ]]
+            else
+              [[ "$version" =~ ^${stable}-[0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*$ ]]
+            fi
+            printf 'version=%s\nbuild_source_revision=%s\nreuse_digest=%s\n' \
+              "$version" "$build_source" "$digest" >> "$GITHUB_OUTPUT"
+            exit
+          fi
+          printf 'build_source_revision=%s\n' "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
-          const archiveChecksum = readFileSync("SHA256SUMS", "utf8").trim().split(" ")[0];
-          assert.match(archiveChecksum, /^[0-9a-f]{64}$/);
-          const provenance = {
-            repository: process.env.GITHUB_REPOSITORY,
-            sourceSha: process.env.GITHUB_SHA,
-            workflowPath: ".github/workflows/qualify.yml",
-            runId: Number(process.env.GITHUB_RUN_ID),
-            runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
-            platform: "linux/amd64",
-            sourceImageId: iid,
-            configDigest: manifest.config.digest,
-            manifestDigest: image.digest,
-            archiveSha256: archiveChecksum,
-          };
-          writeFileSync(join(process.env.RUNNER_TEMP, "oci-provenance.json"), JSON.stringify(provenance, null, 2) + "\n", { flag: "wx" });
-          writeFileSync(process.env.GITHUB_OUTPUT, "image=" + image.digest + "\n", { flag: "a" });
-          console.log("Qualified Web UI OCI manifest " + image.digest +
-            " with normalized config " + manifest.config.digest + " from tested image " + iid);
-          OCI_CHECK
-          sha256sum --check SHA256SUMS
+          mapfile -t existing < <(git tag --points-at "$GITHUB_SHA" | awk '/^v/ {print substr($0,2)}')
+          for version in "${existing[@]}"; do
+            if [[ "$version" =~ $version_pattern ]]; then
+              printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+              exit
+            fi
+          done
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        id: upload
-        with:
-          name: oci-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/oci/
-          if-no-files-found: error
-          compression-level: 0
-          overwrite: false
+          lock_root="$(mktemp -d "$RUNNER_TEMP/semantic-release.XXXXXXXX")"
+          trusted=https://raw.githubusercontent.com/pandops/flowai-team-registry/c18e7cdde5d5b976f549d1dc486f60776cbb8718/.github/semantic-release
+          for file in package.json package-lock.json; do
+            curl -q --fail --silent --show-error --proto '=https' --max-time 30 "$trusted/$file" -o "$lock_root/$file"
+          done
+          (cd "$lock_root" && sha256sum --check <<'LOCKS'
+          891ec3a55b9fccf0b49fe0ac0a98f9e9fd5bbd7f1743e0f0e51d6286a178d16b  package.json
+          aa53698b9420885d999a383abe2f5fafa453bd5aa938dc9ff3ce3e1ef42551a9  package-lock.json
+          LOCKS
+          npm ci --ignore-scripts --no-audit --no-fund)
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        id: upload-provenance
-        with:
-          name: oci-provenance-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/oci-provenance.json
-          if-no-files-found: error
-          overwrite: false
+          mirror="$RUNNER_TEMP/version.git"
+          metadata="$RUNNER_TEMP/version-metadata"
+          git clone --quiet --bare --shared "$GITHUB_WORKSPACE" "$mirror"
+          git -C "$mirror" update-ref "refs/heads/$release_branch" "$GITHUB_SHA"
+          if [[ "$release_branch" != master ]]; then
+            git -C "$mirror" update-ref refs/heads/master "$(git rev-parse refs/remotes/origin/master)"
+          fi
+          git init --quiet --initial-branch="$release_branch" "$metadata"
+          git -C "$metadata" remote add origin "$mirror"
+          git -C "$metadata" fetch --quiet --tags origin "refs/heads/$release_branch:refs/version-source"
+          git -C "$metadata" update-ref "refs/heads/$release_branch" "$GITHUB_SHA"
+
+          jq -n --arg branch "$release_branch" --arg header "$INITIAL_IMPORT" '{
+            branches: (["master"] + if $branch == "master" then [] else [{name:$branch, prerelease:$branch, channel:$branch}] end),
+            plugins: [["@semantic-release/commit-analyzer",
+                       {releaseRules: (if $header == "" then [] else [{header:$header,release:"minor"}] end)}]],
+            tagFormat: "v${version}"
+          }' > "$metadata/.releaserc.json"
+          log="$RUNNER_TEMP/semantic-release.log"
+          (
+            cd "$metadata"
+            env -i PATH="$PATH" HOME="$metadata" LANG=C.UTF-8 NO_COLOR=1 \
+              GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+              "$lock_root/node_modules/.bin/semantic-release" --dry-run --no-ci --repository-url "$mirror"
+          ) 2>&1 | tee "$log"
+          version="$(sed -n 's/^.*[Tt]he next release version is //p' "$log")"
+          [[ "$version" =~ $version_pattern ]]
+          grep -Fq "Skip v$version tag creation in dry-run mode" "$log"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+  container:
+    name: Build and publish the runtime container
+    needs: application
+    permissions:
+      actions: read
+      contents: write
+      packages: write
+    uses: ./.github/workflows/v0052-build-push.yml
+    with:
+      binary_artifact_id: ${{ needs.application.outputs.binary_artifact_id }}
+      binary_sha256: ${{ needs.application.outputs.reuse_digest == '' && needs.application.outputs.binary_sha256 || '' }}
+      version: ${{ needs.application.outputs.version }}
+      runtime_files: '[]'
+      qualification: ${{ format('{{"unit":"success","integration":"not-applicable","schemaInputs":{0}}}', '[]') }}
+      reuse_digest: ${{ needs.application.outputs.reuse_digest }}
+      build_source_revision: ${{ needs.application.outputs.build_source_revision }}
+      production_identity: ${{ needs.application.outputs.production_identity }}

@@ -1,0 +1,340 @@
+name: Build and publish a FlowAI runtime image
+on:
+  workflow_call:
+    inputs:
+      binary_artifact_id:
+        type: string
+        default: ''
+      binary_sha256:
+        type: string
+        default: ''
+      version:
+        type: string
+        required: true
+      reuse_digest:
+        type: string
+        default: ''
+      build_source_revision:
+        type: string
+        default: ''
+      runtime_files:
+        type: string
+        default: '[]'
+      production_identity:
+        type: string
+        required: true
+      qualification:
+        type: string
+        default: ''
+    outputs:
+      image_ref:
+        value: ${{ jobs.publish.outputs.image_ref }}
+permissions: {}
+defaults:
+  run:
+    shell: bash
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: write
+      packages: write
+    concurrency:
+      group: ghcr-${{ github.repository }}
+      cancel-in-progress: false
+    outputs:
+      image_ref: ${{ steps.publish.outputs.image_ref || steps.reuse.outputs.image_ref }}
+    steps:
+      - name: Check binary coordinates and image version
+        env:
+          BINARY_ID: ${{ inputs.binary_artifact_id }}
+          BINARY_SHA256: ${{ inputs.binary_sha256 }}
+          VERSION: ${{ inputs.version }}
+          REUSE_DIGEST: ${{ inputs.reuse_digest }}
+          BUILD_SOURCE: ${{ inputs.build_source_revision }}
+          QUALIFICATION: ${{ inputs.qualification }}
+        run: |
+          if [[ -n "$REUSE_DIGEST" ]]; then
+            [[ "$REUSE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ && "$BUILD_SOURCE" =~ ^[a-f0-9]{40}$ ]]
+            [[ -z "$BINARY_ID" && -z "$BINARY_SHA256" ]]
+          else
+            [[ "$BINARY_ID" =~ ^[1-9][0-9]*$ && "$BINARY_SHA256" =~ ^[a-f0-9]{64}$ ]]
+            [[ -z "$BUILD_SOURCE" || "$BUILD_SOURCE" == "$GITHUB_SHA" ]]
+          fi
+          number='(0|[1-9][0-9]*)'
+          [[ "$VERSION" =~ ^$number\.$number\.$number(-[a-z0-9-]+(\.[a-z0-9-]+)*)?$ ]]
+          [[ "${#VERSION}" -le 128 ]]
+          [[ "$GITHUB_REPOSITORY" =~ ^[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9._-]*$ ]]
+          if [[ -n "$QUALIFICATION" ]]; then
+            jq -e '
+              keys == ["integration","schemaInputs","unit"] and
+              all(.unit, .integration; IN("success", "not-applicable")) and
+              (.schemaInputs | type == "array")
+            ' <<< "$QUALIFICATION" >/dev/null
+          fi
+
+      - name: Check out the exact runtime Containerfile
+        if: inputs.reuse_digest == ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: Containerfile.runtime
+          sparse-checkout-cone-mode: false
+
+      - name: Download only the qualified binary from this run
+        if: inputs.reuse_digest == ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          artifact-ids: ${{ inputs.binary_artifact_id }}
+          path: ${{ runner.temp }}/qualified
+
+      - name: Verify bytes and assemble the minimal runtime context
+        if: inputs.reuse_digest == ''
+        env:
+          BINARY_SHA256: ${{ inputs.binary_sha256 }}
+          RUNTIME_FILES: ${{ inputs.runtime_files }}
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          python3 -I - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import subprocess
+
+          temp = Path(os.environ["RUNNER_TEMP"])
+          qualified = temp / "qualified"
+          app, = qualified.iterdir()
+          assert re.fullmatch(r"app-[1-9][0-9]*", app.name)
+          assert app.is_file() and not app.is_symlink()
+          with app.open("rb") as stream:
+              assert hashlib.file_digest(stream, "sha256").hexdigest() == os.environ["BINARY_SHA256"]
+
+          revision = os.environ["GITHUB_SHA"]
+          extras = json.loads(os.environ["RUNTIME_FILES"])
+          assert isinstance(extras, list) and len(extras) <= 12
+          for path in extras:
+              assert isinstance(path, str) and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*", path)
+              assert path not in {"app", "Containerfile", "Containerfile.runtime"}
+          assert len(set(extras)) == len(extras)
+
+          def checkout_file(path):
+              entry = subprocess.check_output(["git", "ls-tree", revision, "--", path], text=True)
+              assert re.fullmatch(r"100(?:644|755) blob [a-f0-9]{40}\t" + re.escape(path) + r"\n", entry)
+              return subprocess.check_output(["git", "show", f"{revision}:{path}"])
+
+          recipe = checkout_file("Containerfile.runtime")
+          stages = set()
+          context_copies = []
+          current_stage = False
+          for raw in recipe.decode().splitlines():
+              line = raw.strip()
+              if not line:
+                  continue
+              assert not line.endswith(chr(92))
+              if line.startswith("FROM "):
+                  match = re.fullmatch(r"FROM (?:scratch|[a-z0-9][a-z0-9./:_-]*@sha256:[a-f0-9]{64})(?: AS ([a-z0-9_-]+))?", line)
+                  assert match
+                  if stage := match[1]:
+                      assert stage not in stages
+                      stages.add(stage)
+                  current_stage = True
+                  continue
+              assert current_stage
+              if line.startswith("COPY "):
+                  archive = re.fullmatch(r"COPY --from=([a-z0-9_-]+) (/[A-Za-z0-9_./-]+) (/[A-Za-z0-9_./-]+)", line)
+                  if archive:
+                      assert archive[1] in stages
+                  else:
+                      local = re.fullmatch(r"COPY (?:--chmod=0[0-7]{3} )?([A-Za-z0-9_./-]+) /[A-Za-z0-9_./-]+", line)
+                      assert local
+                      context_copies.append(local[1])
+              else:
+                  assert line.split()[0] in {"USER", "EXPOSE", "WORKDIR", "ENV", "LABEL", "ENTRYPOINT", "CMD", "STOPSIGNAL"}
+          assert sorted(context_copies) == sorted(["app", *extras])
+
+          context = temp / "runtime"
+          context.mkdir()
+          shutil.copyfile(app, context / "app")
+          (context / "app").chmod(0o755)
+          (context / "Containerfile").write_bytes(recipe)
+          for name in extras:
+              path = context / name
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_bytes(checkout_file(name))
+          for path in sorted(context.rglob("*"), reverse=True):
+              os.utime(path, (0, 0))
+          PY
+
+      - name: Build and publish the immutable runtime image
+        if: inputs.reuse_digest == ''
+        id: publish
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          state="$(mktemp -d "$RUNNER_TEMP/registry.XXXXXX")"
+          export DOCKER_CONFIG="$state/docker"
+          mkdir "$DOCKER_CONFIG"
+          image="ghcr.io/$GITHUB_REPOSITORY"
+          tag="$image:$VERSION"
+          media='application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+          docker build --platform linux/amd64 --network none --build-arg SOURCE_DATE_EPOCH=0 \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --tag "$tag" --file "$RUNNER_TEMP/runtime/Containerfile" "$RUNNER_TEMP/runtime"
+          [[ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$tag")" == linux/amd64 ]]
+          config="$(docker image inspect --format '{{.Id}}' "$tag")"
+          [[ "$config" =~ ^sha256:[a-f0-9]{64}$ ]]
+
+          scope="scope=repository:$GITHUB_REPOSITORY:pull"
+          token="$(printf 'user = "%s:%s"\n' "$GITHUB_ACTOR" "$GHCR_TOKEN" |
+            curl -q --config - -fsS --max-time 30 --get https://ghcr.io/token \
+              --data-urlencode service=ghcr.io --data-urlencode "$scope,push" | jq -er .token)"
+          [[ "$token" =~ ^[A-Za-z0-9_.=+/-]+$ ]]
+          printf '::add-mask::%s\n' "$token"
+          manifest() {
+            printf 'header = "Authorization: Bearer %s"\n' "$1" |
+              curl -q --config - -sS --max-time 30 -H "Accept: $media" \
+                -o "$state/manifest" -w '%{http_code}' "https://ghcr.io/v2/$GITHUB_REPOSITORY/manifests/$2"
+          }
+          config_matches() { jq -e --arg id "$config" '.schemaVersion == 2 and .config.digest == $id' "$state/manifest" >/dev/null; }
+          manifest_digest() {
+            local checksum
+            checksum="$(sha256sum "$state/manifest")"
+            printf 'sha256:%s\n' "${checksum%% *}"
+          }
+          status="$(manifest "$token" "$VERSION")"
+          case "$status" in
+            200)
+              config_matches
+              digest="$(manifest_digest)"
+              ;;
+            404)
+              absent() {
+                jq -e '(.errors | length) == 1 and (.errors[0].code | IN("MANIFEST_UNKNOWN", "NAME_UNKNOWN"))' "$state/manifest" >/dev/null
+              }
+              absent
+              printf '%s\n' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+              [[ "$(manifest "$token" "$VERSION")" == 404 ]]
+              absent
+              docker push "$tag" | tee "$state/push.log"
+              digest="$(sed -n 's/^.*digest: \(sha256:[a-f0-9]\{64\}\) size: [0-9][0-9]*$/\1/p' "$state/push.log")"
+              [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+              ;;
+            *) exit 1 ;;
+          esac
+
+          public="$(curl -q -fsS --max-time 30 --get https://ghcr.io/token \
+            --data-urlencode service=ghcr.io --data-urlencode "$scope" | jq -er .token)"
+          [[ "$public" =~ ^[A-Za-z0-9_.=+/-]+$ ]]
+          printf '::add-mask::%s\n' "$public"
+          for locator in "$VERSION" "$digest"; do
+            [[ "$(manifest "$public" "$locator")" == 200 ]]
+            config_matches
+            [[ "$(manifest_digest)" == "$digest" ]]
+          done
+          mkdir "$state/anonymous"
+          DOCKER_CONFIG="$state/anonymous" docker pull --platform linux/amd64 "$image@$digest"
+          printf 'image_ref=%s@%s\n' "$image" "$digest" >> "$GITHUB_OUTPUT"
+
+
+      - name: Verify and reuse the exact public image
+        if: inputs.reuse_digest != ''
+        id: reuse
+        env:
+          VERSION: ${{ inputs.version }}
+          DIGEST: ${{ inputs.reuse_digest }}
+        run: |
+          state="$(mktemp -d "$RUNNER_TEMP/reuse.XXXXXX")"
+          image="ghcr.io/$GITHUB_REPOSITORY"
+          scope="scope=repository:$GITHUB_REPOSITORY:pull"
+          token="$(curl -q -fsS --max-time 30 --get https://ghcr.io/token             --data-urlencode service=ghcr.io --data-urlencode "$scope" | jq -er .token)"
+          [[ "$token" =~ ^[A-Za-z0-9_.=+/-]+$ ]]
+          printf '::add-mask::%s\n' "$token"
+          media='application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+          for locator in "$VERSION" "$DIGEST"; do
+            status="$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
+              curl -q --config - -sS --max-time 30 -H "Accept: $media"                 -o "$state/manifest" -w '%{http_code}' "https://ghcr.io/v2/$GITHUB_REPOSITORY/manifests/$locator")"
+            [[ "$status" == 200 ]]
+            printf '%s  %s\n' "${DIGEST#sha256:}" "$state/manifest" | sha256sum --check
+          done
+          DOCKER_CONFIG="$state" docker pull --platform linux/amd64 "$image@$DIGEST"
+          printf 'image_ref=%s@%s\n' "$image" "$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Record the stable semantic-release version
+        if: ${{ github.ref_name == 'master' && inputs.reuse_digest == '' }}
+        env:
+          VERSION: ${{ inputs.version }}
+          IMAGE_REF: ${{ steps.publish.outputs.image_ref }}
+          PRODUCTION_IDENTITY: ${{ inputs.production_identity }}
+          RELEASE_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$PRODUCTION_IDENTITY" =~ ^sha256:[a-f0-9]{64}$ ]]
+          url="https://github.com/$GITHUB_REPOSITORY.git"
+          tag="v$VERSION"
+          target="$(git rev-parse "$GITHUB_SHA^{commit}")"
+          [[ "$IMAGE_REF" =~ @sha256:[a-f0-9]{64}$ ]]
+          record="$(jq -cn --arg repository "$GITHUB_REPOSITORY" --arg source "$target" \
+            --arg version "$VERSION" --arg digest "${IMAGE_REF#*@}" --arg identity "$PRODUCTION_IDENTITY" '
+            {schema:1,stage:"stable",repository:$repository,version:$version,
+             buildSourceRevision:$source,imageDigest:$digest,productionIdentity:$identity}')"
+          if git fetch --quiet --no-tags "$url" "refs/tags/$tag" 2> "$RUNNER_TEMP/release-tag-fetch.log"; then
+            [[ "$(git rev-parse "FETCH_HEAD^{commit}")" == "$target" ]]
+            [[ "$(git cat-file -t FETCH_HEAD)" == tag ]]
+            [[ "$(git cat-file tag FETCH_HEAD | sed '1,/^$/d')" == "$record" ]]
+          else
+            grep -Fq "couldn't find remote ref refs/tags/$tag" "$RUNNER_TEMP/release-tag-fetch.log"
+            git -c user.name=github-actions -c user.email=41898282+github-actions[bot]@users.noreply.github.com \
+              tag -a -m "$record" "$tag" "$target"
+            auth="$(printf 'x-access-token:%s' "$RELEASE_TOKEN" | base64 -w 0)"
+            printf '::add-mask::%s\n' "$auth"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+              GIT_CONFIG_VALUE_0="Authorization: Basic $auth" \
+              git push "$url" "refs/tags/$tag:refs/tags/$tag"
+          fi
+
+      - name: Emit qualification receipt v1
+        if: inputs.qualification != ''
+        env:
+          IMAGE_REF: ${{ steps.publish.outputs.image_ref || steps.reuse.outputs.image_ref }}
+          VERSION: ${{ inputs.version }}
+          QUALIFICATION: ${{ inputs.qualification }}
+          REUSE_DIGEST: ${{ inputs.reuse_digest }}
+          BUILD_SOURCE: ${{ inputs.build_source_revision }}
+        run: |
+          image="ghcr.io/$GITHUB_REPOSITORY"
+          [[ "$IMAGE_REF" == "$image@"* ]]
+          digest="${IMAGE_REF#"$image@"}"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          workflow="${GITHUB_WORKFLOW_REF#"$GITHUB_REPOSITORY/"}"
+          workflow="${workflow%@*}"
+          [[ "$workflow" =~ ^\.github/workflows/[A-Za-z0-9._-]+\.ya?ml$ ]]
+          build=success
+          if [[ -n "$REUSE_DIGEST" ]]; then
+            [[ "$digest" == "$REUSE_DIGEST" ]]
+            build=not-applicable
+          fi
+          jq -ecn --arg repo "$GITHUB_REPOSITORY" --arg source "$GITHUB_SHA"             --arg buildSource "${BUILD_SOURCE:-$GITHUB_SHA}" --arg build "$build" \
+            --arg version "$VERSION" --arg digest "$digest" --argjson qualification "$QUALIFICATION"             --arg workflow "$workflow" --argjson run "$GITHUB_RUN_ID" '
+            $qualification
+            | select(keys == ["integration","schemaInputs","unit"] and (.schemaInputs | type == "array"))
+            | select(all(.unit, .integration; IN("success", "not-applicable")))
+            | {schema:1,repository:$repo,sourceRevision:$source,buildSourceRevision:$buildSource,
+               version:$version,imageDigest:$digest,schemaInputs,workflowPath:$workflow,
+               runId:$run,outcomes:{unit,integration,build:$build}}
+          ' > "$RUNNER_TEMP/qualification.json"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: inputs.qualification != ''
+        with:
+          name: qualification-receipt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/qualification.json
+          if-no-files-found: error
