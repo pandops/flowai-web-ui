@@ -320,7 +320,6 @@ jobs:
           build=success
           if [[ -n "$REUSE_DIGEST" ]]; then
             [[ "$digest" == "$REUSE_DIGEST" ]]
-            build=not-applicable
           fi
           jq -ecn --arg repo "$GITHUB_REPOSITORY" --arg source "$GITHUB_SHA"             --arg buildSource "${BUILD_SOURCE:-$GITHUB_SHA}" --arg build "$build" \
             --arg version "$VERSION" --arg digest "$digest" --argjson qualification "$QUALIFICATION"             --arg workflow "$workflow" --argjson run "$GITHUB_RUN_ID" '
