@@ -418,6 +418,11 @@ test("v0048 Executor create dialog and token view at every supported resolution 
             await expect(heading).toBeVisible();
             const command = await expectKubernetesToken(page, token);
             await expectNoHorizontalScroll(page);
+            if (name.startsWith("mobile-")) {
+              const copy = await page.locator("[data-copy-token]").boundingBox();
+              const value = await page.locator("[data-token-value]").boundingBox();
+              expect(copy?.width).toBeCloseTo(value?.width ?? 0);
+            }
             await copyToken(page, token);
 
             // The install command is selectable independently of the Copy button.
