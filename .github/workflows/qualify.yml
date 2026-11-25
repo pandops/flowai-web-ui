@@ -1,5 +1,7 @@
 name: Qualify and publish web-ui
 on:
+  push:
+    branches: ['**']
   workflow_dispatch:
     inputs:
       expected_source_sha:
@@ -11,16 +13,22 @@ on:
         type: string
         required: false
 
+# Serialize version selection and publication on each Git ref.
+concurrency:
+  group: qualification-${{ github.ref }}
+  queue: max
+
 permissions:
   contents: read
 
 jobs:
   application:
+    if: github.event_name != 'push' || !github.event.deleted
     name: Build and test the application
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      EXPECTED_SOURCE_SHA: ${{ github.event_name == 'push' && github.sha || inputs.expected_source_sha }}
       GOTOOLCHAIN: local
       GOWORK: 'off'
     outputs:
