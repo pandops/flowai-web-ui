@@ -1,43 +1,46 @@
-name: Qualify Web UI
-run-name: Qualify web-ui at ${{ inputs.expected_source_sha }}
-
+name: Qualify and publish web-ui
 on:
   workflow_dispatch:
     inputs:
       expected_source_sha:
-        description: Full commit SHA of the selected Web UI ref
+        description: Selected application commit
         type: string
         required: true
+      reuse_image:
+        description: Existing qualified image pin as JSON when production inputs are unchanged
+        type: string
+        required: false
 
 permissions:
   contents: read
 
 jobs:
-  qualify:
+  application:
+    name: Build and test the application
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 45
     env:
       EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
       GOTOOLCHAIN: local
       GOWORK: 'off'
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      stage: ${{ steps.version.outputs.stage }}
+      production_identity: ${{ steps.version.outputs.production_identity }}
+      reuse_digest: ${{ steps.version.outputs.reuse_digest }}
+      build_source_revision: ${{ steps.version.outputs.build_source_revision }}
+      binary_artifact_id: ${{ steps.binary.outputs.artifact-id }}
+      binary_sha256: ${{ steps.compile.outputs.sha256 }}
     steps:
-      - name: Verify dispatch SHA
+      - name: Bind qualification to the selected commit
         shell: bash
         run: |
-          [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$GITHUB_SHA" == "$EXPECTED_SOURCE_SHA" ]]
-
+          [[ "$EXPECTED_SOURCE_SHA" == "$GITHUB_SHA" ]]
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
-
-      - name: Verify candidate checkout
-        shell: bash
-        run: |
-          [[ "$(git rev-parse HEAD)" == "$EXPECTED_SOURCE_SHA" ]]
-          test -f go.mod
-          test -f test/browser/package-lock.json
 
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
@@ -61,17 +64,363 @@ jobs:
           node node_modules/playwright/cli.js --version
           node node_modules/playwright/cli.js install --with-deps chromium
 
-      - name: Build untagged Linux amd64 artifact
+      - name: Build the Linux application binary
+        id: compile
+        shell: bash
         run: |
-          docker build --platform linux/amd64 -f Containerfile --iidfile "$RUNNER_TEMP/web-ui.iid" .
-          cat "$RUNNER_TEMP/web-ui.iid"
+          mkdir "$RUNNER_TEMP/application"
+          source="$RUNNER_TEMP/application-source"
+          mkdir "$source"
+          git archive --format=tar "$GITHUB_SHA" | tar -xf - -C "$source"
+          (
+            cd "$source"
+            env -i PATH="$PATH" HOME="$HOME" GOENV=off GOTOOLCHAIN=local GOWORK=off \
+              CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v1 \
+              go build -mod=readonly -buildvcs=false -trimpath -ldflags='-s -w' \
+                -o "$RUNNER_TEMP/application/app" ./cmd/web-ui
+          )
+          checksum="$(sha256sum "$RUNNER_TEMP/application/app")"
+          printf 'sha256=%s\n' "${checksum%% *}" >> "$GITHUB_OUTPUT"
 
-      - name: Browser unit tests against the built image
-        run: bash test/browser/qualify-browser.sh "$(cat "$RUNNER_TEMP/web-ui.iid")"
-
-      - name: Verify runner-local image after tests
+      - name: Browser unit tests against the qualified binary
+        working-directory: test/browser
+        shell: bash
+        env:
+          HARNESS_IMAGE: docker.io/library/golang:1.26.2-alpine@sha256:f85330846cde1e57ca9ec309382da3b8e6ae3ab943d2739500e08c86393a21b1
         run: |
-          iid="$(cat "$RUNNER_TEMP/web-ui.iid")"
-          [[ "$(docker image inspect --format '{{.Id}}' "$iid")" == "$iid" ]]
-          [[ "$(docker image inspect --format '{{len .RepoTags}}' "$iid")" == 0 ]]
-          echo "Qualified runner-local Web UI OCI config ID $iid"
+          binary="$RUNNER_TEMP/application/app"
+          digest="$(sha256sum "$binary")"
+          docker pull --platform linux/amd64 "$HARNESS_IMAGE"
+          image_id="$(docker image inspect --format '{{.Id}}' "$HARNESS_IMAGE")"
+          [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$(docker image inspect --format '{{.Id}}' "$image_id")" == "$image_id" ]]
+
+          # The dedicated VM runs one worker, with a second Chromium only for native tests.
+          # Hold the VM's browser qualification lock through process and container absence.
+          exec 9< "${RUNNER_TEMP:?}"
+          flock -n 9
+          browser_root="$(mktemp -d /tmp/flowai-wui.XXXXXXXX)"
+          owner="web-ui-${browser_root##*.}"
+          container_id=''
+          child=''
+          # ShellCheck cannot see the EXIT trap's call through these heredocs.
+          # shellcheck disable=SC2329
+          cleanup() {
+            local status=$? cleanup_failed=0 owned
+            trap - EXIT HUP INT TERM
+            if [[ -n "$child" ]]; then
+              kill -TERM "$child" 2>/dev/null || true
+              wait "$child" || true
+            fi
+            if owned="$(docker ps -aq --no-trunc --filter "label=flowai.web-ui.qualification=$owner")"; then
+              if [[ -n "$owned" ]]; then
+                if [[ "$owned" =~ ^[0-9a-f]{64}$ && ( -z "$container_id" || "$owned" == "$container_id" ) ]]; then
+                  docker rm -f "$owned" >/dev/null || cleanup_failed=1
+                else
+                  cleanup_failed=1
+                fi
+              fi
+              if [[ "$cleanup_failed" == 0 ]] &&
+                 owned="$(docker ps -aq --filter "label=flowai.web-ui.qualification=$owner")" &&
+                 [[ -z "$owned" ]] &&
+                 { [[ -z "$container_id" ]] ||
+                   { owned="$(docker ps -aq --filter "id=$container_id")" && [[ -z "$owned" ]]; }; }; then
+                echo "Web UI container absence verified for $owner"
+              else
+                cleanup_failed=1
+              fi
+            else
+              cleanup_failed=1
+            fi
+            node --input-type=module - "$browser_root" <<'BROWSER_CLEANUP' || cleanup_failed=1
+          import { readFileSync, readdirSync, readlinkSync, rmSync, lstatSync } from "node:fs";
+          import { basename } from "node:path";
+          import { setTimeout as delay } from "node:timers/promises";
+
+          const root = process.argv[2];
+          if (!/^\/tmp\/flowai-wui\.[A-Za-z0-9]{8}$/.test(root ?? "")) {
+            throw new Error("Invalid Web UI browser resource namespace");
+          }
+
+          function owners() {
+            const processes = [];
+            for (const entry of readdirSync("/proc")) {
+              if (!/^[0-9]+$/.test(entry)) continue;
+              try {
+                const dir = `/proc/${entry}`;
+                if (lstatSync(dir).uid !== process.getuid()) continue;
+                const comm = readFileSync(`${dir}/comm`, "utf8").trim();
+                const browserProcess = /^(node|chrome|chromium)/;
+                // Node 24 can expose MainThread as comm.
+                if (!browserProcess.test(comm) &&
+                    !(comm === "MainThread" && browserProcess.test(basename(readlinkSync(`${dir}/exe`))))) continue;
+                const env = readFileSync(`${dir}/environ`, "utf8").split("\0");
+                const args = readFileSync(`${dir}/cmdline`, "utf8").split("\0");
+                if (
+                  env.includes(`FLOWAI_BROWSER_OWNER=${root}`) ||
+                  args.some((arg) => arg.startsWith(`--user-data-dir=${root}/`))
+                ) {
+                  processes.push(Number(entry));
+                }
+              } catch (error) {
+                if (error.code !== "ENOENT" && error.code !== "ESRCH") throw error;
+              }
+            }
+            return processes;
+          }
+
+          let stragglers = owners();
+          const leaked = stragglers.length > 0;
+          for (const signal of ["SIGTERM", "SIGKILL"]) {
+            if (!stragglers.length) break;
+            for (const pid of stragglers) {
+              if (!owners().includes(pid)) continue;
+              try {
+                process.kill(pid, signal);
+              } catch (error) {
+                if (error.code !== "ESRCH") throw error;
+              }
+            }
+            for (let attempt = 0; attempt < 30 && stragglers.length; attempt++) {
+              await delay(100);
+              stragglers = owners();
+            }
+          }
+          if (stragglers.length) throw new Error("Web UI browser processes remain");
+          rmSync(root, { recursive: true, force: true });
+          try {
+            lstatSync(root);
+            throw new Error("Web UI browser directory remains");
+          } catch (error) {
+            if (error.code !== "ENOENT") throw error;
+          }
+          console.log("Web UI browser process and temporary directory absence verified");
+          if (leaked) throw new Error("Web UI processes required forced cleanup");
+          BROWSER_CLEANUP
+            if [[ "$cleanup_failed" != 0 ]]; then exit 1; fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+          trap 'exit 129' HUP
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          container_id="$(docker create --pull=never --name "$owner" \
+            --label "flowai.web-ui.qualification=$owner" \
+            --mount "type=bind,source=$binary,target=/fixture/web-ui,readonly" \
+            --entrypoint /fixture/web-ui --publish 127.0.0.1::8080 "$image_id")"
+          [[ "$container_id" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$(docker inspect --format '{{.Image}}' "$container_id")" == "$image_id" ]]
+          docker start "$container_id" >/dev/null
+          port="$(docker port "$container_id" 8080/tcp)"
+          [[ "$port" =~ ^127\.0\.0\.1:[0-9]+$ ]]
+          origin="http://$port"
+          curl -fsS --retry 12 --retry-connrefused --retry-delay 1 --max-time 2 "$origin/healthz"
+          echo
+
+          FLOWAI_WEB_UI_ORIGIN="$origin" FLOWAI_WEB_UI_IMAGE_ID="$image_id" \
+            FLOWAI_WEB_UI_BINARY_DIGEST="sha256:${digest%% *}" \
+            FLOWAI_BROWSER_NATIVE_TMP="$browser_root" FLOWAI_BROWSER_OWNER="$browser_root" \
+            TMPDIR="$browser_root" TMP="$browser_root" TEMP="$browser_root" \
+            node node_modules/playwright/cli.js test --workers=1 --retries=0 &
+          child=$!
+          browser_status=0
+          wait "$child" || browser_status=$?
+          child=''
+          report_status=0
+          node --input-type=module - test-results/results.json <<'BROWSER_REPORT' || report_status=$?
+          import { readFileSync } from "node:fs";
+
+          const matrix = JSON.parse(readFileSync("supported-resolutions.json"));
+          const report = JSON.parse(readFileSync(process.argv[2], "utf8"));
+          const counts = new Map(matrix.map((cell) => [cell.name, 0]));
+          const files = new Set();
+          const cases = [];
+
+          function collect(suite) {
+            for (const spec of suite.specs ?? []) {
+              files.add(spec.file);
+              cases.push(...spec.tests);
+            }
+            for (const child of suite.suites ?? []) collect(child);
+          }
+
+          report.suites.forEach(collect);
+          const passing = cases.filter(({ results }) => results.length === 1 && results[0].status === "passed");
+          console.log("Web UI browser unit results " + JSON.stringify({
+            specs: files.size,
+            cases: cases.length,
+            passed: passing.length,
+            skipped: report.stats.skipped,
+            unexpected: report.stats.unexpected,
+            flaky: report.stats.flaky,
+          }));
+          for (const { results: [result] } of passing) {
+            for (const att of result.attachments) {
+              if (att.name !== "supported-resolution" || !att.body) continue;
+              const sample = JSON.parse(Buffer.from(att.body, "base64"));
+              const cell = matrix.find((entry) =>
+                entry.width === sample.width && entry.height === sample.height &&
+                entry.deviceScaleFactor === sample.deviceScaleFactor &&
+                entry.hasTouch === sample.hasTouch && entry.colorScheme === sample.theme &&
+                sample.darkMedia === (entry.colorScheme === "dark"),
+              );
+              if (!cell) throw new Error(`Unexpected measured resolution: ${JSON.stringify(sample)}`);
+              counts.set(cell.name, counts.get(cell.name) + 1);
+            }
+          }
+          for (const cell of matrix) console.log(JSON.stringify({ ...cell, passedMeasurements: counts.get(cell.name) }));
+          if (
+            files.size !== 65 || cases.length !== 482 || passing.length !== 482 ||
+            report.errors.length || [...counts.values()].some((count) => count === 0)
+          ) {
+            throw new Error("Browser qualification requires all 482 cases and six measured cells to pass");
+          }
+          BROWSER_REPORT
+          if (( browser_status != 0 )); then exit "$browser_status"; fi
+          [[ "$(sha256sum "$binary")" == "$digest" ]]
+          printf 'Browser-qualified Web UI binary sha256:%s\n' "${digest%% *}"
+          exit "$report_status"
+
+      - name: Prepare the binary from this attempt
+        if: ${{ inputs.reuse_image == '' }}
+        shell: bash
+        run: mv "$RUNNER_TEMP/application/app" "$RUNNER_TEMP/application/app-$GITHUB_RUN_ATTEMPT"
+
+      - name: Retain the application binary
+        id: binary
+        if: ${{ inputs.reuse_image == '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: app-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/application/app-${{ github.run_attempt }}
+          archive: false
+          retention-days: 7
+          if-no-files-found: error
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        if: ${{ inputs.reuse_image == '' }}
+        with:
+          node-version: '24.20.0'
+          package-manager-cache: false
+
+      - name: Resolve the artifact version
+        id: version
+        shell: bash
+        env:
+          REUSE_PIN: ${{ inputs.reuse_image }}
+          PRODUCTION_PATHS: "[\".gitattributes\",\"Containerfile.runtime\",\"cmd\",\"internal\",\"go.mod\",\"go.sum\",\"schemas\",\"web\"]"
+          INITIAL_IMPORT: "Extract standalone Web UI service"
+        run: |
+          mapfile -t paths < <(jq -er '.[]' <<< "$PRODUCTION_PATHS")
+          workflow_json() {
+            git show "$1:$2" | yq -p yaml -o json '.'
+          }
+          production_tree() {
+            local source="$1"
+            {
+              git ls-tree -r "$source" -- "${paths[@]}" | sed '/_test\.go$/d' || return
+              workflow_json "$source" .github/workflows/qualify.yml |
+                jq -ce '. as $workflow | .jobs as $jobs | $jobs.application as $job | ($job.steps | map(select((.uses // "") | startswith("actions/setup-go@")) | {uses,with})) as $toolchains | ($job.steps | map(select(.id == "compile") | {shell,run,env})) as $compilers | select(($toolchains | length) == 1 and ($compilers | length) == 1) | {runner:$job."runs-on", defaults:$workflow.defaults, env:$workflow.env, job_defaults:$job.defaults, job_env:$job.env, runtime_files:$jobs.container.with.runtime_files, toolchain:$toolchains[0], compiler:$compilers[0]}' || return
+              workflow_json "$source" .github/workflows/v0052-build-push.yml |
+                jq -ce '. as $workflow | .jobs.publish as $job | ($job.steps | map(.id) | index("assemble")) as $assemble | select($assemble != null) | {runner:$job."runs-on", defaults:$workflow.defaults, env:$workflow.env, job_defaults:$job.defaults, job_env:$job.env, steps:$job.steps[:($assemble + 1)]}' || return
+            } | sha256sum | cut -d ' ' -f1
+          }
+          identity="$(production_tree "$GITHUB_SHA")"
+          printf 'production_identity=sha256:%s\n' "$identity" >> "$GITHUB_OUTPUT"
+          release_branch="$GITHUB_REF_NAME"
+          stable='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          version_pattern="^${stable}$"
+          stage=stable
+          if [[ "$release_branch" != master ]]; then
+            stage=snapshot
+            # Give each distinct input set its own prerelease channel. This
+            # also separates it from the earlier pilot snapshots in GHCR.
+            channel="snapshot-${identity:0:16}"
+            release_branch="$channel"
+            version_pattern="^${stable}-${channel}\.[1-9][0-9]*$"
+          fi
+          printf 'stage=%s\n' "$stage" >> "$GITHUB_OUTPUT"
+
+          if [[ -n "$REUSE_PIN" ]]; then
+            build_source="$(jq -er '.buildSourceRevision | select(test("^[a-f0-9]{40}$"))' <<< "$REUSE_PIN")"
+            digest="$(jq -er '.imageDigest | select(test("^sha256:[a-f0-9]{64}$"))' <<< "$REUSE_PIN")"
+            version="$(jq -er .version <<< "$REUSE_PIN")"
+            [[ "$(production_tree "$build_source")" == "$identity" ]]
+            if [[ "$stage" == stable ]]; then
+              [[ "$version" =~ ^${stable}$ ]]
+            else
+              [[ "$version" =~ ^${stable}-[0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*$ ]]
+            fi
+            printf 'version=%s\nbuild_source_revision=%s\nreuse_digest=%s\n' \
+              "$version" "$build_source" "$digest" >> "$GITHUB_OUTPUT"
+            exit
+          fi
+          printf 'build_source_revision=%s\n' "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+          mapfile -t existing < <(git tag --points-at "$GITHUB_SHA" | awk '/^v/ {print substr($0,2)}')
+          for version in "${existing[@]}"; do
+            if [[ "$version" =~ $version_pattern ]]; then
+              printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+              exit
+            fi
+          done
+
+          lock_root="$(mktemp -d "$RUNNER_TEMP/semantic-release.XXXXXXXX")"
+          trusted=https://raw.githubusercontent.com/pandops/flowai-team-registry/c18e7cdde5d5b976f549d1dc486f60776cbb8718/.github/semantic-release
+          for file in package.json package-lock.json; do
+            curl -q --fail --silent --show-error --proto '=https' --max-time 30 "$trusted/$file" -o "$lock_root/$file"
+          done
+          (cd "$lock_root" && sha256sum --check <<'LOCKS'
+          891ec3a55b9fccf0b49fe0ac0a98f9e9fd5bbd7f1743e0f0e51d6286a178d16b  package.json
+          aa53698b9420885d999a383abe2f5fafa453bd5aa938dc9ff3ce3e1ef42551a9  package-lock.json
+          LOCKS
+          npm ci --ignore-scripts --no-audit --no-fund)
+
+          mirror="$RUNNER_TEMP/version.git"
+          metadata="$RUNNER_TEMP/version-metadata"
+          git clone --quiet --bare --shared "$GITHUB_WORKSPACE" "$mirror"
+          git -C "$mirror" update-ref "refs/heads/$release_branch" "$GITHUB_SHA"
+          if [[ "$release_branch" != master ]]; then
+            git -C "$mirror" update-ref refs/heads/master "$(git rev-parse refs/remotes/origin/master)"
+          fi
+          git init --quiet --initial-branch="$release_branch" "$metadata"
+          git -C "$metadata" remote add origin "$mirror"
+          git -C "$metadata" fetch --quiet --tags origin "refs/heads/$release_branch:refs/version-source"
+          git -C "$metadata" update-ref "refs/heads/$release_branch" "$GITHUB_SHA"
+
+          jq -n --arg branch "$release_branch" --arg header "$INITIAL_IMPORT" '{
+            branches: (["master"] + if $branch == "master" then [] else [{name:$branch, prerelease:$branch, channel:$branch}] end),
+            plugins: [["@semantic-release/commit-analyzer",
+                       {releaseRules: (if $header == "" then [] else [{header:$header,release:"minor"}] end)}]],
+            tagFormat: "v${version}"
+          }' > "$metadata/.releaserc.json"
+          log="$RUNNER_TEMP/semantic-release.log"
+          (
+            cd "$metadata"
+            env -i PATH="$PATH" HOME="$metadata" LANG=C.UTF-8 NO_COLOR=1 \
+              GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+              "$lock_root/node_modules/.bin/semantic-release" --dry-run --no-ci --repository-url "$mirror"
+          ) 2>&1 | tee "$log"
+          version="$(sed -n 's/^.*[Tt]he next release version is //p' "$log")"
+          [[ "$version" =~ $version_pattern ]]
+          grep -Fq "Skip v$version tag creation in dry-run mode" "$log"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+  container:
+    name: Build and publish the runtime container
+    needs: application
+    permissions:
+      actions: read
+      contents: write
+      packages: write
+    uses: ./.github/workflows/v0052-build-push.yml
+    with:
+      binary_artifact_id: ${{ needs.application.outputs.binary_artifact_id }}
+      binary_sha256: ${{ needs.application.outputs.reuse_digest == '' && needs.application.outputs.binary_sha256 || '' }}
+      version: ${{ needs.application.outputs.version }}
+      runtime_files: '[]'
+      qualification: ${{ format('{{"unit":"success","integration":"not-applicable","schemaInputs":{0}}}', '[]') }}
+      reuse_digest: ${{ needs.application.outputs.reuse_digest }}
+      build_source_revision: ${{ needs.application.outputs.build_source_revision }}
+      production_identity: ${{ needs.application.outputs.production_identity }}

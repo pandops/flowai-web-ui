@@ -1,0 +1,56 @@
+[
+  {
+    "name": "mobile-light",
+    "width": 390,
+    "height": 844,
+    "deviceScaleFactor": 3,
+    "isMobile": true,
+    "hasTouch": true,
+    "colorScheme": "light"
+  },
+  {
+    "name": "mobile-dark",
+    "width": 390,
+    "height": 844,
+    "deviceScaleFactor": 3,
+    "isMobile": true,
+    "hasTouch": true,
+    "colorScheme": "dark"
+  },
+  {
+    "name": "tablet-light",
+    "width": 820,
+    "height": 1180,
+    "deviceScaleFactor": 2,
+    "isMobile": true,
+    "hasTouch": true,
+    "colorScheme": "light"
+  },
+  {
+    "name": "tablet-dark",
+    "width": 820,
+    "height": 1180,
+    "deviceScaleFactor": 2,
+    "isMobile": true,
+    "hasTouch": true,
+    "colorScheme": "dark"
+  },
+  {
+    "name": "desktop-light",
+    "width": 1440,
+    "height": 900,
+    "deviceScaleFactor": 1,
+    "isMobile": false,
+    "hasTouch": false,
+    "colorScheme": "light"
+  },
+  {
+    "name": "desktop-dark",
+    "width": 1440,
+    "height": 900,
+    "deviceScaleFactor": 1,
+    "isMobile": false,
+    "hasTouch": false,
+    "colorScheme": "dark"
+  }
+]
